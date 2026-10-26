@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scannermouse"
+version = "0.1.0"
+description = "GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "opencv-python", "PyGObject", "pycairo"]
+
+[project.urls]
+Homepage = "https://github.com/Cerv4ntez/gnome-lg-scannermouse"
+
+[project.gui-scripts]
+scannermouse = "scannermouse.app:main"
+
+[tool.setuptools]
+packages = ["scannermouse"]

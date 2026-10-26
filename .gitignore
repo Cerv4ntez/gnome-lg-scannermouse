@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+scan*.png
+*.mjpg
+*.pkl
+build/
+dist/
+*.egg-info/
+pkg/
+src/
+*.pkg.tar.zst
+gnome-lg-scannermouse/

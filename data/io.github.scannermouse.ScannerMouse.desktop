@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Scanner Mouse
+Comment=Scan documents with the LG scanner mouse
+Exec=scannermouse
+Icon=scanner
+Terminal=false
+Categories=Graphics;Scanning;GTK;GNOME;
+Keywords=scan;scanner;mouse;LG;
+StartupNotify=true
