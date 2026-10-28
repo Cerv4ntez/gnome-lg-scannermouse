@@ -1,6 +1,6 @@
 # Maintainer: Cerv4ntez <18594385+Cerv4ntez@users.noreply.github.com>
 pkgname=gnome-lg-scannermouse
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)'
 arch=('any')
@@ -24,6 +24,8 @@ build() {
 package() {
   cd "$pkgname"
   python -m installer --destdir="$pkgdir" dist/*.whl
+  install -d "$pkgdir/usr/share/icons"
   install -Dm644 data/io.github.scannermouse.ScannerMouse.desktop -t "$pkgdir/usr/share/applications"
+  cp -r data/icons/hicolor "$pkgdir/usr/share/icons/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
 }

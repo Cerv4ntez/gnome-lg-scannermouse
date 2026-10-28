@@ -33,6 +33,7 @@ SPECK_INK = 200               # grey level below which a pixel belongs to a dot 
 SPECK_AREA = 40               # dots up to this area may be removed ...
 SPECK_DISTANCE = 12           # ... if they are farther than this from any letter (i-dots never are)
 TEXT_AREA = 60                # components at least this big count as letters
+CONTRAST_PIVOT = 170          # grey level the contrast setting keeps: darker gets darker, lighter lighter
 
 
 def analyse(gray, covered):
@@ -154,6 +155,15 @@ def despeckle(gray, scale=1.0):
     out = gray.copy()
     out[remove] = 255
     return out
+
+
+def contrast(gray, amount):
+    """Stretch grey levels around CONTRAST_PIVOT by `amount` (1 = unchanged).
+    Paper stays white, pale text turns darker and faint grey on the paper lighter."""
+    if amount == 1.0:
+        return gray
+    lut = np.clip(CONTRAST_PIVOT + (np.arange(256) - CONTRAST_PIVOT) * amount, 0, 255)
+    return cv2.LUT(gray, lut.astype(np.uint8))
 
 
 def crop_box(covered, min_fill=0.6):

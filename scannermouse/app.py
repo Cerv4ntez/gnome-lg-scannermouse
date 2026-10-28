@@ -34,6 +34,10 @@ AUTO_SETTLE = 4       # frames to wait after changing exposure
 AUTO_ROUNDS = 4       # adjustments at most
 ANALYSE_EVERY = 1.0   # s between text/skew measurements of the live preview
 PREVIEW_EVERY = 0.4   # s between preview updates while scanning
+CONTRAST_MAX = 2.5    # contrast setting: 1 leaves the page as scanned
+CONTRAST_DEFAULT = 1.5
+ZOOM_MAX = 8.0        # times the size that fits the window
+ZOOM_STEP = 1.25      # per mouse-wheel notch
 SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), 'scannermouse', 'settings.json')
 
 
@@ -55,7 +59,7 @@ def _new_recording():
 
 def _load_settings():
     settings = {'auto_exposure': True, 'exposure': EXPOSURE_DEFAULT, 'best_frames': True,
-                'straighten': True, 'clean_background': True}
+                'straighten': True, 'clean_background': True, 'contrast': CONTRAST_DEFAULT}
     try:
         with open(SETTINGS_FILE) as f:
             settings.update(json.load(f))
@@ -114,6 +118,7 @@ class Window(Adw.ApplicationWindow):
         self.last_preview = 0.0
         self.ocr_version = 0           # identifies the latest text recognition
         self.ocr_timer = 0
+        self.preview_timer = 0
         self.rotate_right = Gtk.Button(icon_name='object-rotate-right-symbolic', tooltip_text='Rotate Right')
         self.rotate_right.connect('clicked', lambda *_: self._rotate(-1))
         self.rotate_left = Gtk.Button(icon_name='object-rotate-left-symbolic', tooltip_text='Rotate Left')
@@ -174,18 +179,51 @@ class Window(Adw.ApplicationWindow):
         page_hint.add_css_class('dim-label')
         page_hint.add_css_class('caption')
         grid.attach(page_hint, 0, 10, 2, 1)
+        self.contrast_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, CONTRAST_MAX, 0.1)
+        self.contrast_scale.set_value(self.settings['contrast'])
+        self.contrast_scale.set_digits(1)
+        self.contrast_scale.set_format_value_func(lambda _, v: f'{v:.1f}×')
+        self.contrast_scale.add_mark(1.0, Gtk.PositionType.BOTTOM, None)
+        self.contrast_scale.add_mark(CONTRAST_DEFAULT, Gtk.PositionType.BOTTOM, None)
+        self.contrast_scale.connect('value-changed', lambda *_: (self._settings_changed(), self._page_changed()))
+        grid.attach(Gtk.Separator(), 0, 11, 2, 1)
+        grid.attach(Gtk.Label(label='Contrast', xalign=0), 0, 12, 2, 1)
+        grid.attach(self.contrast_scale, 0, 13, 2, 1)
+        contrast_hint = Gtk.Label(label='Darkens pale text and lightens faint grey on the paper. '
+                                        '1.0× leaves the page as scanned.',
+                                  xalign=0, wrap=True, max_width_chars=36)
+        contrast_hint.add_css_class('dim-label')
+        contrast_hint.add_css_class('caption')
+        grid.attach(contrast_hint, 0, 14, 2, 1)
         self.settings_button = Gtk.MenuButton(icon_name='emblem-system-symbolic', tooltip_text='Scanner Settings',
                                               popover=Gtk.Popover(child=grid))
         header.pack_end(self.settings_button)
 
         self.page = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True)
+        # Ctrl + mouse wheel zooms: the picture grows inside the scroller
+        self.zoom = 1.0                # times the size that fits the window
+        self.zoom_anchor = None        # (page point 0..1, pointer) to keep in place once laid out
+        self.pointer = None
+        self.render_scale = 1.0        # resolution of the preview relative to the full page
+        self.render_size = PREVIEW_SIZE  # longest side the preview was asked for
+        self.scroller = Gtk.ScrolledWindow(child=self.page)
+        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)   # before the scroller scrolls
+        wheel.connect('scroll', self._on_wheel)
+        self.scroller.add_controller(wheel)
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', lambda c, x, y: setattr(self, 'pointer', (x, y)))
+        motion.connect('leave', lambda c: setattr(self, 'pointer', None))
+        self.scroller.add_controller(motion)
+        for adj in (self.scroller.get_hadjustment(), self.scroller.get_vadjustment()):
+            adj.connect('changed', lambda adj: self._apply_zoom_anchor())
         self.empty = Adw.StatusPage(
             icon_name='scanner-symbolic', title='No Scan Yet',
             description='Press <b>Start Scan</b>, then slowly sweep the mouse over the page.\n'
                         'Press the <b>Scan</b> button on the mouse (or Esc) to finish.')
         self.stack = Gtk.Stack()
         self.stack.add_named(self.empty, 'empty')
-        self.stack.add_named(self.page, 'page')
+        self.stack.add_named(self.scroller, 'page')
 
         self.live_view = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, width_request=320, height_request=122)
         self.live_view.add_css_class('card')
@@ -245,6 +283,7 @@ class Window(Adw.ApplicationWindow):
         self.stitcher.reset()
         self.analysis, self.page_turns = None, 0
         self._clear_text()
+        self._set_zoom(1.0)
         self.stitcher.start()                   # background re-registration and rebuilding
         self.dirty = False
         self.stack.set_visible_child_name('empty')
@@ -413,6 +452,7 @@ class Window(Adw.ApplicationWindow):
         self.settings['best_frames'] = self.best_switch.get_active()
         self.settings['straighten'] = self.straighten_switch.get_active()
         self.settings['clean_background'] = self.clean_switch.get_active()
+        self.settings['contrast'] = round(self.contrast_scale.get_value(), 1)
         _save_settings(self.settings)
 
     # -- UI ---------------------------------------------------------------
@@ -517,6 +557,7 @@ class Window(Adw.ApplicationWindow):
         if page is None:
             return None
         img, covered, scale = page
+        self.render_scale = scale
         turns = self.turns
         if self.settings['straighten'] or self.settings['clean_background']:
             angle, is_text = self._analyse(img, covered)
@@ -529,6 +570,7 @@ class Window(Adw.ApplicationWindow):
         if self.crop_button.get_active() if crop is None else crop:
             top, bottom, left, right = cleanup.crop_box(covered)
             img = img[top:bottom, left:right]
+        img = cleanup.contrast(img, self.settings['contrast'])
         return np.ascontiguousarray(np.rot90(img, turns))
 
     def _analyse(self, img, covered):
@@ -557,20 +599,115 @@ class Window(Adw.ApplicationWindow):
         GLib.idle_add(apply)
 
     def _show_page(self):
-        page = self._render(PREVIEW_SIZE)
+        self.render_size = self._preview_size()
+        page = self._render(self.render_size)
         if page is not None:
             self.page.set_paintable(_texture(page))
+            self._size_page()
             self.stack.set_visible_child_name('page')
+
+    # -- zoom -------------------------------------------------------------
+
+    def _on_wheel(self, controller, dx, dy):
+        if not controller.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
+            return False                        # plain scrolling
+        self._set_zoom(self.zoom * ZOOM_STEP ** -dy, self.pointer)
+        return True
+
+    def _layout(self, zoom):
+        """(width, height, left, top) of the shown page at `zoom`, in scroller content
+        pixels, or None. A page smaller than the window is centred in it."""
+        texture = self.page.get_paintable()
+        vw, vh = self.scroller.get_width(), self.scroller.get_height()
+        if texture is None or vw <= 0 or vh <= 0:
+            return None
+        iw, ih = texture.get_intrinsic_width(), texture.get_intrinsic_height()
+        fit = min(vw / iw, vh / ih)
+        w, h = iw * fit * zoom, ih * fit * zoom
+        return w, h, max(0.0, (vw - w) / 2), max(0.0, (vh - h) / 2)
+
+    def _set_zoom(self, zoom, pointer=None):
+        """Zoom to `zoom` (1 = fit the window), keeping the page point under the
+        pointer (or the middle of the view) where it is."""
+        zoom = min(max(zoom, 1.0), ZOOM_MAX)
+        layout = self._layout(self.zoom)
+        if zoom == self.zoom or layout is None:
+            self.zoom = zoom
+            self._size_page()
+            return
+        w, h, left, top = layout
+        x, y = pointer or (self.scroller.get_width() / 2, self.scroller.get_height() / 2)
+        if self.zoom_anchor is None:
+            hval = self.scroller.get_hadjustment().get_value()
+            vval = self.scroller.get_vadjustment().get_value()
+        else:                                   # the last step isn't laid out yet: go on from its target
+            au, av, ax, ay = self.zoom_anchor
+            hval, vval = au * w + left - ax, av * h + top - ay
+        u = (hval + x - left) / w
+        v = (vval + y - top) / h
+        self.zoom = zoom
+        self.zoom_anchor = (min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0), x, y)
+        self._size_page()
+        self._apply_zoom_anchor()               # in case the size didn't change
+        # zoomed in beyond the preview's resolution: render it sharper
+        if self.render_scale < 1.0 and self._preview_size() > self.render_size and not self.preview_timer:
+            self.preview_timer = GLib.timeout_add(150, self._delayed_preview)
+
+    def _size_page(self):
+        layout = self._layout(self.zoom) if self.zoom > 1.0 else None
+        if layout is None:
+            self.page.set_size_request(-1, -1)
+        else:
+            self.page.set_size_request(int(layout[0]), int(layout[1]))
+
+    def _apply_zoom_anchor(self):
+        """Scroll so the zoom anchor is back under the pointer, once the scroller
+        has taken on the new page size."""
+        layout = self._layout(self.zoom)
+        if self.zoom_anchor is None or layout is None:
+            return
+        w, h, left, top = layout
+        hadj, vadj = self.scroller.get_hadjustment(), self.scroller.get_vadjustment()
+        if (abs(hadj.get_upper() - max(w, hadj.get_page_size())) > 1.5
+                or abs(vadj.get_upper() - max(h, vadj.get_page_size())) > 1.5):
+            return                              # not laid out yet
+        u, v, x, y = self.zoom_anchor
+        self.zoom_anchor = None
+        hadj.set_value(u * w + left - x)
+        vadj.set_value(v * h + top - y)
+
+    def _preview_size(self):
+        """Longest side to render the preview at: enough for the zoom, in device pixels."""
+        layout = self._layout(self.zoom) if self.zoom > 1.0 else None
+        if layout is None:
+            return PREVIEW_SIZE
+        return max(PREVIEW_SIZE, int(max(layout[:2]) * self.get_scale_factor()))
 
     def _rotate(self, turns):
         self.turns = (self.turns + turns) % 4
         self._show_page()
-        # recognise the text again once the turning has stopped
+        self._schedule_ocr()
+
+    def _page_changed(self):
+        """A look setting changed: update the preview, at most every 150 ms while the
+        slider moves, and recognise the text again."""
+        if not self.preview_timer:
+            self.preview_timer = GLib.timeout_add(150, self._delayed_preview)
+        if self.state == 'idle':
+            self._schedule_ocr()
+
+    def _delayed_preview(self):
+        self.preview_timer = 0
+        self._show_page()
+        return GLib.SOURCE_REMOVE
+
+    def _schedule_ocr(self):
+        """Recognise the text again once the changes (turning, sliders) have stopped."""
         if self.ocr_timer:
             GLib.source_remove(self.ocr_timer)
-        self.ocr_timer = GLib.timeout_add(1200, self._rotated_ocr)
+        self.ocr_timer = GLib.timeout_add(1200, self._delayed_ocr)
 
-    def _rotated_ocr(self):
+    def _delayed_ocr(self):
         self.ocr_timer = 0
         self._start_ocr()
         return GLib.SOURCE_REMOVE
@@ -666,6 +803,7 @@ class Window(Adw.ApplicationWindow):
             self.analysis, self.page_turns = None, 0
             self._clear_text()
             self.dirty = False
+            self._set_zoom(1.0)
             self.page.set_paintable(None)
             self.stack.set_visible_child_name('empty')
             self._update_controls()
@@ -727,7 +865,7 @@ class Window(Adw.ApplicationWindow):
             except (OSError, ScannerError):
                 pass
             self._teardown()
-        self.stitcher.mapper.stop()
+        self.stitcher.close()
         return False
 
 
@@ -749,6 +887,14 @@ def _save_pdf(gray, path):
 class Application(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        # running from a checkout: the icon isn't installed into the system theme
+        icons = os.path.join(os.path.dirname(__file__), os.pardir, 'data', 'icons')
+        if os.path.isdir(icons):
+            Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(icons)
+        Gtk.Window.set_default_icon_name(APP_ID)
 
     def do_activate(self):
         win = self.get_active_window() or Window(self)

@@ -17,12 +17,21 @@ and runs two background workers while the scan goes on:
 
 So the more of the page is scanned, the more segments are tied together and
 the more accurate the page becomes.
+
+The Mapper runs in a separate process (MapperProcess), so its work never
+competes with live tracking for the interpreter lock. Rebuilt pages come back
+through shared memory.
 """
 
 import collections
 import math
+import multiprocessing
+import os
+import queue
 import threading
 import time
+import traceback
+from multiprocessing import shared_memory
 
 import cv2
 import numpy as np
@@ -305,3 +314,208 @@ class Mapper:
 def _compose(base, rel):
     t = base[:2] + align._rot(base[2]) @ rel[:2]
     return np.array([t[0], t[1], base[2] + rel[2]])
+
+
+# -- running the Mapper in its own process ------------------------------------
+
+def _share_canvas(canvas):
+    """Copy a canvas into a new shared memory block; the receiver frees it."""
+    h, w = canvas.sum.shape
+    shm = shared_memory.SharedMemory(create=True, size=max(1, 4 * h * w * 4), track=False)
+    view = np.ndarray((4, h, w), np.float32, shm.buf)
+    view[:] = (canvas.sum, canvas.weight, canvas.best, canvas.score)
+    del view
+    shm.close()
+    return shm.name, h, w, canvas.origin.copy(), canvas.bbox
+
+
+def _take_canvas(shared):
+    """The canvas from `_share_canvas`, copied out; frees the shared block."""
+    from .stitcher import Canvas
+    name, h, w, origin, bbox = shared
+    shm = shared_memory.SharedMemory(name=name, track=False)
+    try:
+        view = np.ndarray((4, h, w), np.float32, shm.buf)
+        layers = view.copy()
+        del view
+    finally:
+        shm.close()
+        shm.unlink()
+    canvas = Canvas()
+    canvas.sum, canvas.weight, canvas.best, canvas.score = layers
+    canvas.origin, canvas.bbox = origin, bbox
+    return canvas
+
+
+def _worker(inbox, outbox):
+    """Main loop of the background process: one Mapper per scan."""
+    from .stitcher import render_segments
+    mapper, scan = None, None
+
+    def watch(parent):
+        parent.join()                           # the app ended without saying so (crash, kill)
+        os._exit(0)
+    threading.Thread(target=watch, args=(multiprocessing.parent_process(),), daemon=True).start()
+
+    def publish(scan):
+        def render(segments, poses, fit, stats):
+            canvas = render_segments(segments, poses, fit, stats)
+            outbox.put(('rendered', scan, len(segments), np.array(poses), fit, dict(stats),
+                        _share_canvas(canvas)))
+        return render
+
+    while True:
+        try:
+            msg = inbox.get()
+        except (EOFError, OSError):
+            msg = ('quit',)                     # the app is gone
+        kind = msg[0]
+        if kind in ('reset', 'quit') and mapper is not None:
+            mapper.stop()
+            mapper = None
+        if kind == 'quit':
+            outbox.put(('quit',))
+            return
+        if kind == 'reset':
+            scan = msg[1]
+            mapper = Mapper(publish(scan))
+        elif mapper is None or msg[1] != scan:
+            continue                            # left over from an earlier scan
+        elif kind == 'start':
+            mapper.start()
+        elif kind == 'add':
+            mapper.add(*msg[2])
+        elif kind == 'finish':
+            mapper.finish(lambda f: outbox.put(('progress', scan, f)))
+            outbox.put(('finished', scan, dict(mapper.stats)))
+
+
+class LocalSegment:
+    __slots__ = ('img', 'sharpness', 'confidence', 'reason')
+
+    def __init__(self, img, sharpness, confidence, reason):
+        self.img = img
+        self.sharpness = sharpness
+        self.confidence = confidence
+        self.reason = reason
+
+
+class MapperProcess:
+    """The Mapper, run in a background process. Same interface for the live tracker.
+
+    Positions are kept here too: from the tracked links as segments come in,
+    and replaced by the Mapper's whenever a rebuilt page arrives, so they always
+    match the page in use. `on_render(n, poses, canvas)` is called (from a
+    receiving thread) with each rebuilt page; the tracker adopts it via
+    `adopt` and `corrected`.
+    """
+
+    def __init__(self, on_render):
+        self.on_render = on_render
+        ctx = multiprocessing.get_context('spawn')   # forking a GTK process is unsafe
+        self.inbox, self.outbox = ctx.Queue(), ctx.Queue()
+        self.process = ctx.Process(target=_worker, args=(self.inbox, self.outbox),
+                                   name='scannermouse-mapper', daemon=True)
+        self.process.start()
+        self.lock = threading.Lock()
+        self.scan = 0
+        self.progress = None
+        self.finished = threading.Event()
+        self.closed = threading.Event()
+        self._clear()
+        threading.Thread(target=self._receive, daemon=True).start()
+
+    def _clear(self):
+        self.segments = []                      # LocalSegment per segment
+        self.poses = []
+        self.fit = []
+        self.stats = collections.Counter()
+
+    def reset(self):
+        with self.lock:
+            self.scan += 1
+            self._clear()
+        self.finished.clear()
+        self.inbox.put(('reset', self.scan))
+
+    def start(self):
+        self.inbox.put(('start', self.scan))
+
+    def add(self, img, sharpness, feats, pose, link, confidence, reason=None):
+        """Store a segment and return its index (see Mapper.add)."""
+        with self.lock:
+            i = len(self.segments)
+            self.segments.append(LocalSegment(img, sharpness, confidence, reason))
+            if link is not None and i > 0:
+                self.poses.append(_compose(self.poses[i - 1], np.array(link[0], float)))
+            else:
+                self.poses.append(np.array(pose, float))
+        self.inbox.put(('add', self.scan, (img, sharpness, feats, pose, link, confidence, reason)))
+        return i
+
+    def pose(self, index):
+        with self.lock:
+            return self.poses[index].copy()
+
+    def corrected(self, k, n, poses):
+        """Where segment k (stored after a rebuild of n segments) lies once the rebuild's
+        `poses` are adopted: it keeps its offset to the last rebuilt segment."""
+        with self.lock:
+            if k < n:
+                return poses[k].copy()
+            return _compose(poses[n - 1], align.relative(self.poses[n - 1], self.poses[k]))
+
+    def adopt(self, n, poses, fit):
+        with self.lock:
+            moved = [_compose(poses[n - 1], align.relative(self.poses[n - 1], p)) for p in self.poses[n:]]
+            self.poses = list(poses) + moved
+            self.fit = list(fit)
+
+    def finish(self, progress=None):
+        """After the scan: final registration and rebuild, in the background process.
+        Returns once the final page has been handed to `on_render`."""
+        self.progress = progress
+        self.inbox.put(('finish', self.scan))
+        while not self.finished.wait(0.5):
+            if not self.process.is_alive():
+                raise RuntimeError('the background process stopped')
+        self.progress = None
+
+    def stop(self):
+        """Stop working on the current scan (the process stays, for the next one)."""
+        self.reset()
+
+    def close(self):
+        if self.process.is_alive():
+            self.inbox.put(('quit',))
+            self.closed.wait(5)                 # frees pages still under way
+        self.process.join(1)
+
+    def _receive(self):
+        while True:
+            try:
+                msg = self.outbox.get(timeout=1.0)
+            except queue.Empty:
+                if self.process.is_alive():
+                    continue
+                return
+            except (EOFError, OSError):
+                return
+            kind, current = msg[0], len(msg) > 1 and msg[1] == self.scan
+            if kind == 'quit':
+                self.closed.set()
+                return
+            if kind == 'rendered':
+                _, _, n, poses, fit, stats, shared = msg
+                canvas = _take_canvas(shared)   # always, to free the shared memory
+                if current:
+                    self.stats = collections.Counter(stats)
+                    try:
+                        self.on_render(n, poses, fit, canvas)
+                    except Exception:           # e.g. a new scan began during the hand-over
+                        traceback.print_exc()
+            elif kind == 'progress' and current and self.progress:
+                self.progress(msg[2])
+            elif kind == 'finished' and current:
+                self.stats = collections.Counter(msg[2])
+                self.finished.set()

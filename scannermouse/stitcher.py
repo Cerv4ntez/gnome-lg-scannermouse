@@ -15,7 +15,7 @@ preview, using ORB feature matching:
 
 Frames that moved are kept as segments by the Mapper (mapper.py), which keeps
 re-registering all segments against each other and rebuilding the page from
-them in the background. Each rebuilt page replaces the live one, and the
+them in a background process. Each rebuilt page replaces the live one, and the
 tracker continues from the corrected positions.
 
 Two pages are kept: one averaging all frames, and one showing for each area the
@@ -29,7 +29,7 @@ import threading
 import cv2
 import numpy as np
 
-from .mapper import Mapper, overlap_agrees
+from .mapper import MapperProcess, overlap_agrees
 
 CROP_TOP = 56                 # rows hidden or shadowed by the housing
 DPI = 320                     # nominal sensor resolution (LG spec sheet)
@@ -53,6 +53,7 @@ SINGLE_TO_PIXELS = (np.array([[-0.0110, 0.2686], [-0.2771, -0.0182]]),
 # The sensor record in a frame lags its image by about a third of a frame, so a
 # frame's motion is blended with the next frame's (frames are processed one late).
 SENSOR_LAG = 0.3
+SENSOR_MAX_STEP = 200         # px per frame; more is a counter jump (as when scanning starts), not motion
 
 # -- feature matching ------------------------------------------------------------
 ORB_FEATURES = 1500
@@ -65,6 +66,7 @@ SNAP_MIN_AGE = 30             # frames; younger keyframes are part of the curren
 SNAP_RADIUS = 350             # px; keyframes this close to the current estimate are tried
 SNAP_TRIES = 2                # keyframes tried per frame
 SNAP_MAX_JUMP = 200           # px; snaps moving the frame further are wrong matches (repeated words)
+MAGNIFICATION_MAX = 2.5       # limit of the scale change tracked while the mouse is lifted
 LOST_AFTER = 4                # unplaceable frames in a row before the position counts as lost
 RELOCATE_EVERY = 3            # while lost, search all keyframes on every n-th frame
 RESUME_AFTER = 8              # tracked frames before painting resumes on new ground after a lift
@@ -393,12 +395,11 @@ class Stitcher:
         self.reset()
 
     def reset(self):
-        if self.mapper is not None:
-            self.mapper.stop()
+        if self.mapper is None:
+            self.mapper = MapperProcess(self._adopt)
         with self.lock:
+            self.mapper.reset()
             self.canvas = Canvas()
-            self.mapper = Mapper(render_segments)
-            self.synced = -1                   # pose version of the canvas in use
             self.anchor = None                 # (segment, its pose as the tracker knows it)
             self.pose = np.zeros(3)            # x, y of the frame centre in world coords; rotation (rad)
             self.last = None                   # previous MouseRecord
@@ -420,10 +421,16 @@ class Stitcher:
             self.last_track = None             # inliers of the last frame-to-frame match
             self.last_match = None             # inliers of the last keyframe match
             self.snap_scale = 1.0
+            self.magnification = 1.0           # page px per px of the last frame (above 1 while lifted)
+            self.velocity = None               # last step, carried on over frames that can't be matched
 
     def start(self):
         """Start the background re-registration and re-composition."""
         self.mapper.start()
+
+    def close(self):
+        """End the background process."""
+        self.mapper.close()
 
     @property
     def pos(self):
@@ -521,30 +528,39 @@ class Stitcher:
 
     # -- keeping up with the Mapper ----------------------------------------
 
-    def _sync(self):
-        """Adopt the Mapper's latest rebuilt page and its corrected positions."""
-        rendered = self.mapper.rendered
-        if rendered is None or rendered[0] <= self.synced:
-            return
-        version, n, canvas = rendered
-        # segments stored after that rebuild started go on top of it
-        with self.mapper.lock:
-            later = [(self.mapper.segments[k], self.mapper.poses[k].copy())
-                     for k in range(n, len(self.mapper.segments))]
-        for seg, pose in later:
-            canvas.paint(seg.img.astype(np.float32) / 255, pose, seg.sharpness, seg.confidence,
-                         weight=1.0 if seg.sharpness is not None else REJECTED_WEIGHT)
-        self.canvas = canvas
-        self.synced = version
-        # continue tracking from the corrected position of the last segment
-        if self.anchor is not None:
-            k, known = self.anchor
-            now = self.mapper.pose(k)
-            fix = lambda p: compose(now, relative(known, p))
-            self.pose = fix(self.pose)
-            if self.prev is not None:
-                self.prev = (fix(self.prev[0]), self.prev[1])
-            self.anchor = (k, now)
+    def _adopt(self, n, poses, fit, canvas):
+        """Adopt a page the Mapper rebuilt from its first n segments, and its
+        corrected positions (called from the thread receiving the pages)."""
+        scan = self.mapper.scan
+        # segments stored after that rebuild started go on top of it, at their
+        # corrected positions: most of them here, the last few under the lock
+        done = n
+        while self.mapper.scan == scan and len(self.mapper.segments) - done > 2:
+            end = len(self.mapper.segments)
+            for k in range(done, end):
+                self._paint_segment(canvas, k, self.mapper.corrected(k, n, poses))
+            done = end
+        with self.lock:
+            if self.mapper.scan != scan:
+                return                          # a new scan began meanwhile
+            self.mapper.adopt(n, poses, fit)
+            for k in range(done, len(self.mapper.segments)):
+                self._paint_segment(canvas, k, self.mapper.pose(k))
+            self.canvas = canvas
+            # continue tracking from the corrected position of the last segment
+            if self.anchor is not None:
+                k, known = self.anchor
+                now = self.mapper.pose(k)
+                fix = lambda p: compose(now, relative(known, p))
+                self.pose = fix(self.pose)
+                if self.prev is not None:
+                    self.prev = (fix(self.prev[0]), self.prev[1])
+                self.anchor = (k, now)
+
+    def _paint_segment(self, canvas, k, pose):
+        seg = self.mapper.segments[k]
+        canvas.paint(seg.img.astype(np.float32) / 255, pose, seg.sharpness, seg.confidence,
+                     weight=1.0 if seg.sharpness is not None else REJECTED_WEIGHT)
 
     # -- frame intake ------------------------------------------------------
 
@@ -576,13 +592,11 @@ class Stitcher:
         self.frame_no += 1
 
         with self.lock:
-            self._sync()
-
             # 1. motion since the previous frame: features, else the mouse sensors
             step, source, weight = None, None, 0.0     # pose relative to the previous frame
             track_scale = 1.0
             sensor_step = None
-            if sensor is not None and np.any(sensor[0]):
+            if sensor is not None and np.any(sensor[0]) and math.hypot(*sensor[0]) <= SENSOR_MAX_STEP:
                 sensor_step = np.array([-sensor[0][0], -sensor[0][1], sensor[1]])
             if self.prev is not None:
                 step, self.last_track = feats.relative_to(self.prev[1], TRACK_MIN_INLIERS)
@@ -598,8 +612,22 @@ class Stitcher:
                 if step is not None:
                     source, track_scale = 'features', feats.last_scale
                     weight = float(np.clip(self.last_track / 100.0, 0.4, 3.0))
+                    # A lifted mouse sees the page smaller, so a step in the image
+                    # covers more of the page (up to ~1.7x in a quick lift between
+                    # sweeps). The sensors tell when it is down at the nominal scale;
+                    # there, scale changes are tilt and noise and are ignored.
+                    if max(rec.quality1, rec.quality2) >= QUALITY_MIN:
+                        self.magnification = 1.0
+                    else:
+                        # where this frame's centre lands in the previous one, scale included
+                        shift = step[:2] + (track_scale - 1) * _rot(step[2]) @ feats.centre
+                        step = np.array([*(shift * self.magnification), step[2]])
+                        self.magnification = float(np.clip(self.magnification * track_scale,
+                                                           1 / MAGNIFICATION_MAX, MAGNIFICATION_MAX))
             if step is None and sensor_step is not None and self.prev is not None:
                 step, source, weight = sensor_step, 'sensor', SENSOR_LINK_WEIGHT
+            if step is not None:
+                self.velocity = step
             pose = compose(self.prev[0], step) if step is not None else None
             step_size = math.hypot(step[0], step[1]) if step is not None else 0.0
             self.speed += SPEED_SMOOTHING * (step_size - self.speed)
@@ -629,8 +657,15 @@ class Stitcher:
             elif pose is not None:
                 self.link = None
 
-            # keep tracking relative to this frame even when it isn't painted
-            self.prev = (pose if pose is not None else (self.prev[0] if self.prev else np.zeros(3)), feats)
+            # keep tracking relative to this frame even when it isn't painted; until the
+            # position counts as lost, assume the motion went on as before
+            if pose is not None:
+                ref = pose
+            elif self.prev is not None and self.velocity is not None and not self.lost and self.unsure < LOST_AFTER:
+                ref = compose(self.prev[0], self.velocity)
+            else:
+                ref = self.prev[0] if self.prev else np.zeros(3)
+            self.prev = (ref, feats)
             self.last_source = source if pose is not None else None
             if pose is None:
                 self.unsure += 1
@@ -677,9 +712,6 @@ class Stitcher:
         """After the scan: final re-registration and rebuild of the whole page."""
         self.flush()
         self.mapper.finish(progress)
-        with self.lock:
-            self.synced = -1
-            self._sync()
 
     @property
     def misplaced(self):

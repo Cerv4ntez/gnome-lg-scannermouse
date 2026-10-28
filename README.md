@@ -33,6 +33,8 @@ Your user must be able to open the scanner's `/dev/videoN` node (the `video` gro
 4. Turn the page upright with the rotate buttons. **Crop**, on by default, trims the
    ragged edges. Then save as PNG or PDF.
 
+Hold Ctrl and turn the mouse wheel to zoom into the page; the wheel alone then scrolls.
+
 Output is greyscale: the scanner lights the page with a green LED and the sensor
 records no usable blue, so colour cannot be recovered.
 
@@ -77,6 +79,11 @@ can be edited and copied (**Copy All**), or saved as a `.txt` file.
   for German).
 - **Re-reading:** turning the page with the rotate buttons reads it again.
 
+**Contrast** (settings menu, 1.5× by default) stretches the grey levels around a light
+grey: pale text gets darker and faint grey on the paper lighter, while white paper stays
+white. 1.0× leaves the page as scanned. It applies to the preview, saved files and text
+recognition, and can be changed at any time.
+
 **Exposure** is in the settings menu. In automatic mode (the default) it is measured
 during the first quarter second of each scan and then held fixed. Manual values run
 from 2 to 16; the vendor driver used 5, which leaves the image dark and noisy.
@@ -106,11 +113,17 @@ The protocol below was recovered from the vendor driver DLLs.
   - **Unknown position.** A frame is only painted when its position is known.
     After the mouse is lifted, it is matched against all keyframes to find the spot
     before painting resumes.
+  - **Lifting between sweeps.** A lifted mouse sees the page smaller, so a step in
+    the image covers more of the page (up to ~1.7× in a quick lift). While both
+    sensors report no surface, the scale change between frames is accumulated and
+    steps are enlarged by it. A few frames that can't be matched continue the last
+    motion instead of losing it.
   - **Sensor lag.** The sensor reading in a frame lags its image by about a third of
     a frame, so frames are processed one frame late to interpolate.
 - **Continuous re-registration** ([`mapper.py`](scannermouse/mapper.py)). Every
   frame that moved is kept as a segment, and two background workers run during
-  the scan.
+  the scan. They run in a separate process, so they never hold up live tracking; rebuilt
+  pages come back through shared memory.
   - **Registration.** Each segment is matched against all older segments that may
     overlap it: those near its current position, and any found by feature lookup.
     When idle, the worker re-checks older segments. Every 1.5 s it solves for the
@@ -137,9 +150,6 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 
 ## Limitations
 
-- The background workers compete with live tracking for Python's interpreter lock,
-  so 10–25% of frames are dropped on a fast scan. Coverage is unaffected, because
-  consecutive frames overlap heavily, but the preview is less smooth.
 - The sensor fallback's constants were calibrated from one 40 s test scan. They are
   not read from the calibration data stored in the mouse's EEPROM.
 - Keep the mouse on the page. If it is lifted and set down somewhere the keyframes

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scannermouse"
-version = "0.1.0"
+version = "0.1.1"
 description = "GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
