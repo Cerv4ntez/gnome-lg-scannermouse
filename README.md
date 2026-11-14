@@ -136,6 +136,10 @@ The protocol below was recovered from the vendor driver DLLs.
     sensors report no surface, the scale change between frames is accumulated and
     steps are enlarged by it. A few frames that can't be matched continue the last
     motion instead of losing it.
+  - **Weak matches.** With few matching points (under 60), the rotation a frame-to-frame
+    match reports is unreliable: errors of 1–3° per frame once added up to a 15° kink
+    after a slip. Such a match keeps its shift, but the rotation comes from the sensors,
+    or is taken as none if only one of them tracks.
   - **LED reflections.** On glossy photos the LEDs are reflected into the camera as four
     bright spots at fixed places along the top edge of the frame. Painted from every
     frame, they turned smooth dark areas such as hair into rows of rungs, and as image

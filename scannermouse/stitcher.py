@@ -66,6 +66,8 @@ ORB_FEATURES = 1500
 RATIO = 0.8                   # Lowe's ratio test for descriptor matches
 RANSAC_PX = 3.0               # reprojection tolerance
 TRACK_MIN_INLIERS = 20        # frame-to-frame match accepted
+ROTATION_MIN_INLIERS = 60     # below this, a match's rotation is unreliable (errors of 1-3 degrees
+                              # per frame added up to a 15 degree kink); the sensors' is used instead
 SNAP_MIN_INLIERS = 40         # match to an older keyframe accepted (stricter: a wrong one does damage)
 KEYFRAME_SPACING = 80         # px between keyframes
 SNAP_MIN_AGE = 30             # frames; younger keyframes are part of the current sweep
@@ -686,6 +688,10 @@ class Stitcher:
                     if math.hypot(*(step[:2] - sensor_step[:2])) > limit:
                         step = None
                         self.track_rejected += 1
+                if step is not None and self.last_track < ROTATION_MIN_INLIERS:
+                    # weak match: keep its shift, take the rotation from the sensors (none
+                    # if only one of them tracks)
+                    step = np.array([step[0], step[1], sensor[1] if sensor is not None else 0.0])
                 if step is not None:
                     source, track_scale = 'features', feats.last_scale
                     weight = float(np.clip(self.last_track / 100.0, 0.4, 3.0))
