@@ -158,12 +158,22 @@ def despeckle(gray, scale=1.0):
 
 
 def contrast(gray, amount):
-    """Stretch grey levels around CONTRAST_PIVOT by `amount` (1 = unchanged).
-    Paper stays white, pale text turns darker and faint grey on the paper lighter."""
+    """Steepen grey levels around CONTRAST_PIVOT by `amount` (1 = unchanged).
+    Paper stays white, pale text turns darker and faint grey on the paper lighter.
+
+    On either side of the pivot, x / (a - (a - 1) x) (x the distance from black or
+    white, 1 at the pivot) has slope `amount` at the pivot and 1 / `amount` at black
+    and white. Nothing is clipped and shadows keep their detail: a straight stretch
+    turned most of a dark photo pure black.
+    """
     if amount == 1.0:
         return gray
-    lut = np.clip(CONTRAST_PIVOT + (np.arange(256) - CONTRAST_PIVOT) * amount, 0, 255)
-    return cv2.LUT(gray, lut.astype(np.uint8))
+    v = np.arange(256, dtype=np.float64)
+    p = float(CONTRAST_PIVOT)
+    curve = lambda x: x / (amount - (amount - 1) * x)
+    lut = np.where(v <= p, p * curve(np.minimum(v / p, 1)),
+                   255 - (255 - p) * curve(np.minimum((255 - v) / (255 - p), 1)))
+    return cv2.LUT(gray, np.round(lut).astype(np.uint8))
 
 
 def crop_box(covered, min_fill=0.6):

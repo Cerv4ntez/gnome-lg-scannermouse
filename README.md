@@ -79,9 +79,10 @@ can be edited and copied (**Copy All**), or saved as a `.txt` file.
   for German).
 - **Re-reading:** turning the page with the rotate buttons reads it again.
 
-**Contrast** (settings menu, 1.5× by default) stretches the grey levels around a light
+**Contrast** (settings menu, 1.5× by default) steepens the grey levels around a light
 grey: pale text gets darker and faint grey on the paper lighter, while white paper stays
-white. 1.0× leaves the page as scanned. It applies to the preview, saved files and text
+white. The curve flattens towards black and white instead of clipping, so the shadows of
+a photo keep their detail. 1.0× leaves the page as scanned. It applies to the preview, saved files and text
 recognition, and can be changed at any time.
 
 **Exposure** is in the settings menu. In automatic mode (the default) it is measured
@@ -103,9 +104,10 @@ The protocol below was recovered from the vendor driver DLLs.
   JPEG header: the SOF0 dimension bytes and the end of the second quantisation table.
   It holds a frame counter, X/Y counters from two motion sensors, their surface quality
   and the button state ([`framedecode.py`](scannermouse/framedecode.py)).
-- **Lighting.** The LED lights each frame unevenly, about 30% darker towards the
-  bottom. Every frame is divided by a fixed, measured profile of that light, so a
-  photo keeps its own brightness. The brightest part of the page becomes white.
+- **Lighting.** The LED lights each frame unevenly, about a third darker at
+  two-thirds of the height. Every frame is divided by a fixed profile of that light,
+  calibrated so that the same spot of the page comes out equally bright wherever it
+  appears in the frame. A photo keeps its own brightness. The brightest part of the page becomes white.
 - **Stitching** ([`stitcher.py`](scannermouse/stitcher.py)) uses OpenCV ORB features.
   - **Tracking.** Each frame is matched to the previous one, which gives its movement
     and rotation. The two laser sensors are the fallback where there is too little

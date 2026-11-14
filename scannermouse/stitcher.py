@@ -103,14 +103,18 @@ REJECTED_WEIGHT = 0.05        # weight of rejected frames on the averaged page
 WHITE_POINT = 0.95            # output: values above this share of the brightest part of the page become white
 WHITE_PERCENTILE = 99.5       # ... measured as this percentile of the scanned pixels
 
-# The LED lights the frame unevenly: brightest at the top, about 30% darker
-# towards the bottom middle. Brightness relative to the brightest point, as a
+# The LED lights the frame unevenly: brightest at the top, about a third darker
+# at two-thirds of the height. Brightness relative to the brightest point, as a
 # polynomial in u (-1 left .. 1 right) and v (-1 top .. 1 bottom) of the cropped
-# frame; measured from the 90th percentile of each pixel over a scan of paper and
-# photos. A fixed profile keeps the page's own brightness: estimating the light
-# from the image itself turns the dark parts of a photo grey.
-ILLUMINATION = {(0, 0): 0.7581, (0, 1): -0.1125, (0, 2): 0.0947,      # (power of u, power of v): coefficient
-                (1, 0): -0.0022, (1, 1): -0.0021, (2, 0): 0.0991}
+# frame. Calibrated from overlapping scans: the same spot of the page, seen at
+# different places in the frame, must come out equally bright (residual about 3%).
+# A fixed profile keeps the page's own brightness: estimating the light from the
+# image itself turns the dark parts of a photo grey.
+ILLUMINATION = {                      # (power of u, power of v): coefficient
+    (0, 0): 0.5848, (0, 1): -0.2011, (0, 2): 0.2712, (0, 3): 0.1370, (0, 4): -0.0899,
+    (1, 0): -0.0078, (1, 1): -0.0182, (1, 2): -0.0172, (1, 3): 0.0483, (1, 4): 0.0393,
+    (2, 0): 0.1051, (2, 1): 0.1106, (2, 2): -0.1675, (2, 3): -0.0918, (2, 4): -0.0020,
+}
 
 
 @functools.cache
