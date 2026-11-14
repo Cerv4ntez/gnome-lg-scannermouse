@@ -1,6 +1,6 @@
 # Maintainer: Cerv4ntez <18594385+Cerv4ntez@users.noreply.github.com>
 pkgname=gnome-lg-scannermouse
-pkgver=0.1.3
+pkgver=0.1.4
 pkgrel=1
 pkgdesc='GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)'
 arch=('any')

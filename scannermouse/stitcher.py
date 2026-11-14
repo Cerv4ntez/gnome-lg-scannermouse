@@ -282,10 +282,14 @@ class Canvas:
             return 0.0                          # blank where the page has text, or the reverse
         return float((a * b).mean()) / math.sqrt(ea * eb)
 
-    def paint(self, img, pose, sharp=None, confidence=0.0, blend=True, weight=1.0):
+    def paint(self, img, pose, sharp=None, confidence=0.0, blend=True, weight=1.0, fine=False):
         """Paint a frame at `pose` onto the averaged page (unless `blend` is False,
         with `weight`) and, given its reduced local sharpness map, onto the
-        best-frame page."""
+        best-frame page.
+
+        `fine` interpolates the image cubically: linear interpolation at sub-pixel
+        positions loses about a quarter of the fine detail, but cubic takes longer,
+        so the live preview uses linear and the rebuilt pages cubic."""
         h, w = img.shape
         corners = np.array([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]], float)
         cx, cy = self._to_canvas(corners[:, 0], corners[:, 1], pose, h, w)
@@ -299,11 +303,15 @@ class Canvas:
         ty = pose[1] + self.origin[1] - y0 - (s * (w - 1) / 2 + c * (h - 1) / 2)
         M = np.float32([[c, -s, tx], [s, c, ty]])
         wmask = _edge_weight(h, w)
-        layers = [img * wmask, wmask]
-        if sharp is not None:
-            layers += [img, cv2.resize(sharp, (w, h), interpolation=cv2.INTER_LINEAR)]
-        warped = cv2.warpAffine(np.dstack(layers).astype(np.float32), M, (x1 - x0, y1 - y0),
-                                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        warp = lambda layers, flags: cv2.warpAffine(np.dstack(layers).astype(np.float32), M, (x1 - x0, y1 - y0),
+                                                    flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # weights always linear: cubic overshoots below 0
+        image = warp([img * wmask, img], cv2.INTER_CUBIC if fine else cv2.INTER_LINEAR)
+        weights = warp([wmask] + ([cv2.resize(sharp, (w, h), interpolation=cv2.INTER_LINEAR)] if sharp is not None else []),
+                       cv2.INTER_LINEAR)
+        if weights.ndim == 2:
+            weights = weights[..., None]
+        warped = np.dstack([image[..., 0], weights[..., 0], image[..., 1]] + ([weights[..., 1]] if sharp is not None else []))
         ws = warped[..., 1]
         if blend:
             self.sum[y0:y1, x0:x1] += warped[..., 0] * weight
@@ -386,7 +394,7 @@ def render_segments(segments, poses, fit, stats=None):
     for seg, img, pose, ok in zip(segments, imgs, poses, fit):
         # blurred / tilted / lifted / not fitting segments only fill otherwise empty spots
         usable = seg.sharpness is not None and ok is not False
-        canvas.paint(img, pose, weight=1.0 if usable else REJECTED_WEIGHT)
+        canvas.paint(img, pose, weight=1.0 if usable else REJECTED_WEIGHT, fine=True)
     disagreeing = 0
     for seg, img, pose, ok in zip(segments, imgs, poses, fit):
         if seg.sharpness is None or ok is False:
@@ -396,7 +404,7 @@ def render_segments(segments, poses, fit, stats=None):
         if agreement is not None and agreement < CONSENSUS_MIN:
             disagreeing += 1
             continue
-        canvas.paint(img, pose, seg.sharpness, seg.confidence, blend=False)
+        canvas.paint(img, pose, seg.sharpness, seg.confidence, blend=False, fine=True)
     if stats is not None:
         stats['disagreeing'] = disagreeing
     return canvas
