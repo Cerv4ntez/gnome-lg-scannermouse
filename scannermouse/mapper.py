@@ -67,6 +67,18 @@ COMPOSE_EVERY = 3.0           # s at least between page rebuilds (they compete w
 MISPLACED_PX = 12             # median disagreement with neighbours that marks a segment misplaced
 ODOMETRY_WEIGHT = 0.1         # weight of sensor-only links between consecutive segments
 RATIO = 0.8
+# Straight lines (a photo's edge, ruled lines) guide the final pass: pieces of one line seen
+# in many segments must lie on one straight line on the page, which removes bends that
+# build up along sweeps that overlap too little to be tied together
+LINE_MIN_LENGTH = 80          # px within a segment
+LINE_GROUP_ANGLE = math.radians(2.0)   # pieces of one line differ in direction by at most this ...
+LINE_GROUP_PX = 12            # ... and in position by at most this
+LINE_JOIN_PX = 40             # parts of one line broken by a misplaced sweep may be this far apart,
+LINE_JOIN_OVERLAP = 30        # ... if they follow each other along the line (overlapping by at
+                              # most this many px); parallel lines run side by side instead
+LINE_MIN_SPAN = 400           # px a line must cover on the page
+LINE_MIN_SEGMENTS = 4         # segments a line must be seen in
+LINE_MAX_WORSE = 1.0          # px the overlaps may fit worse (median) for the straightened positions
 
 
 def _weight(inliers):
@@ -192,6 +204,9 @@ class Mapper:
             if progress and i % 25 == 0:
                 progress(0.6 + 0.2 * i / len(self.segments))
         self._solve()
+        if progress:
+            progress(0.85)
+        self._straighten()
         if progress:
             progress(0.9)
         self._compose()
@@ -351,6 +366,53 @@ class Mapper:
                     self.fit[k] = float(np.median(errors[k])) <= MISPLACED_PX
             self.pose_version += 1
 
+    # -- straight lines -------------------------------------------------------
+
+    def _straighten(self):
+        """Solve the positions once more with long straight lines kept straight; keep the
+        result only if the overlaps still fit about as well."""
+        with self.lock:
+            poses = np.array(self.poses)
+            edges = list(self.edges)
+            usable = [k for k, seg in enumerate(self.segments)
+                      if seg.reason is None and self.fit[k] is not False]
+        if len(poses) < 3 or not edges or not usable:
+            return
+        h, w = self.segments[0].img.shape
+        centre = np.array([(w - 1) / 2, (h - 1) / 2])
+        lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+        pieces = []                             # (segment, end points centred (2, 2))
+        for k in usable:
+            found = lsd.detect(self.segments[k].img)[0]
+            if found is None:
+                continue
+            for x1, y1, x2, y2 in found.reshape(-1, 4):
+                if math.hypot(x2 - x1, y2 - y1) < LINE_MIN_LENGTH:
+                    continue
+                # a line along the frame border is the edge of the scan area, not of the page
+                m = 8
+                if ((max(x1, x2) < m) or (min(x1, x2) > w - 1 - m)
+                        or (max(y1, y2) < m) or (min(y1, y2) > h - 1 - m)):
+                    continue
+                pieces.append((k, np.array([[x1, y1], [x2, y2]]) - centre))
+        lines = _group_lines(pieces, poses)
+        if not lines:
+            return
+        tagged = [(k, ends, n) for n, members in enumerate(lines) for k, ends in (pieces[i] for i in members)]
+        new = align.solve_lines(poses, edges, tagged, len(lines))
+        before, after = _overlap_misfit(poses, edges), _overlap_misfit(new, edges)
+        self.stats['straight lines'] = len(lines)
+        if after > before + LINE_MAX_WORSE:
+            self.stats['straightening rejected'] += 1
+            return
+        with self.lock:
+            # segments added meanwhile keep their offset to the last solved one
+            n = len(poses)
+            for k in range(n, len(self.poses)):
+                self.poses[k] = _compose(new[n - 1], align.relative(poses[n - 1], self.poses[k]))
+            self.poses[:n] = list(new)
+            self.pose_version += 1
+
     # -- composition ---------------------------------------------------------
 
     def _compose(self):
@@ -364,6 +426,92 @@ class Mapper:
             return
         canvases = self.render(segments, poses, fit, self.stats)
         self.rendered = (version, n, canvases)
+
+
+def _group_lines(pieces, poses):
+    """Groups (lists of piece indices) of line pieces that lie on one long straight
+    line on the page, seen in enough segments."""
+    if not pieces:
+        return []
+    world = []
+    for k, ends in pieces:
+        world.append(ends @ align._rot(poses[k][2]).T + poses[k][:2])
+    world = np.array(world)
+    d = world[:, 1] - world[:, 0]
+    angle = np.arctan2(d[:, 1], d[:, 0]) % math.pi
+    parent = list(range(len(pieces)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i in range(len(pieces)):
+        u = d[i] / np.linalg.norm(d[i])
+        normal = np.array([-u[1], u[0]])
+        for j in range(i + 1, len(pieces)):
+            da = abs(angle[i] - angle[j])
+            if min(da, math.pi - da) > LINE_GROUP_ANGLE:
+                continue
+            if np.abs((world[j] - world[i][0]) @ normal).max() > LINE_GROUP_PX:
+                continue
+            parent[root(i)] = root(j)
+    groups = collections.defaultdict(list)
+    for i in range(len(pieces)):
+        groups[root(i)].append(i)
+    groups = _join_broken(list(groups.values()), world)
+    out = []
+    for members in groups:
+        if len({pieces[i][0] for i in members}) < LINE_MIN_SEGMENTS:
+            continue
+        pts = world[members].reshape(-1, 2)
+        direction = np.linalg.svd(pts - pts.mean(0))[2][0]
+        if np.ptp((pts - pts.mean(0)) @ direction) >= LINE_MIN_SPAN:
+            out.append(members)
+    return out
+
+
+def _join_broken(groups, world):
+    """Join groups that are parts of one line broken by a misplaced sweep: nearly the
+    same direction, close, and one following the other along the line."""
+    def fit(members):
+        pts = world[members].reshape(-1, 2)
+        centre = pts.mean(0)
+        u = np.linalg.svd(pts - centre)[2][0]
+        along = (pts - centre) @ u
+        return centre, u, along.min(), along.max()
+    joined = True
+    while joined:
+        joined = False
+        for a in range(len(groups)):
+            ca, ua, _, _ = fit(groups[a])
+            for b in range(a + 1, len(groups)):
+                cb, ub, _, _ = fit(groups[b])
+                if math.acos(min(1.0, abs(float(ua @ ub)))) > LINE_GROUP_ANGLE:
+                    continue
+                normal = np.array([-ua[1], ua[0]])
+                if abs(float((cb - ca) @ normal)) > LINE_JOIN_PX:
+                    continue
+                # extents of both along a's direction
+                pa = (world[groups[a]].reshape(-1, 2) - ca) @ ua
+                pb = (world[groups[b]].reshape(-1, 2) - ca) @ ua
+                overlap = min(pa.max(), pb.max()) - max(pa.min(), pb.min())
+                if overlap > LINE_JOIN_OVERLAP:
+                    continue                    # side by side: two different lines
+                groups[a] = groups[a] + groups[b]
+                del groups[b]
+                joined = True
+                break
+            if joined:
+                break
+    return groups
+
+
+def _overlap_misfit(poses, edges):
+    """Median disagreement (px) of the overlap measurements with `poses`."""
+    errors = [math.hypot(*(align.relative(poses[i], poses[j])[:2] - meas[:2]))
+              for i, j, meas, w in edges if j - i > 1]
+    return float(np.median(errors)) if errors else 0.0
 
 
 def _compose(base, rel):

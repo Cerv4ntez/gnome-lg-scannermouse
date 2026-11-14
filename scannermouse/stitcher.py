@@ -68,6 +68,8 @@ SNAP_RADIUS = 350             # px; keyframes this close to the current estimate
 SNAP_TRIES = 2                # keyframes tried per frame
 SNAP_MAX_JUMP = 200           # px; snaps moving the frame further are wrong matches (repeated words)
 MAGNIFICATION_MAX = 2.5       # limit of the scale change tracked while the mouse is lifted
+EARLY_LIFT_WITHIN = 60        # frames (2 s): a lift this soon after the start ...
+EARLY_LIFT_FRAMES = 5         # ... of at least this many frames with both sensors off restarts the scan
 LOST_AFTER = 4                # unplaceable frames in a row before the position counts as lost
 RELOCATE_EVERY = 3            # while lost, search all keyframes on every n-th frame
 RESUME_AFTER = 8              # tracked frames before painting resumes on new ground after a lift
@@ -414,6 +416,8 @@ class Stitcher:
     def __init__(self):
         self.lock = threading.Lock()
         self.mapper = None
+        self.started = False
+        self.restarts = 0                      # scans restarted after an early lift
         self.reset()
 
     def reset(self):
@@ -433,6 +437,9 @@ class Stitcher:
             self.discarded = collections.Counter()   # frames kept off the best-frame page, by reason
             self.frame_no = 0
             self.frames_used = 0
+            self.off_surface = 0               # consecutive frames with both sensors off the surface
+            self.off_untracked = False         # ... during which the image couldn't be tracked either
+            self.early_lift = False            # lifted soon after the start: restart when put down
             self.unsure = 0                    # consecutive frames that couldn't be placed
             self.track_rejected = 0            # feature steps dropped for contradicting the sensors
             self.speed = 0.0                   # recent motion, px per frame (smoothed, for display)
@@ -447,6 +454,8 @@ class Stitcher:
 
     def start(self):
         """Start the background re-registration and re-composition."""
+        self.started = True
+        self.restarts = 0
         self.mapper.start()
 
     def close(self):
@@ -586,6 +595,23 @@ class Stitcher:
         """
         if rec is None:
             return False
+        # Lifted right after the start (to reposition the mouse, say): what was scanned
+        # before can't be placed reliably relative to where it is put down, so start
+        # afresh there. A lift shows in both sensors losing the surface and the image
+        # losing track; on glossy paper the sensors alone can drop out while the
+        # camera keeps tracking.
+        off = max(rec.quality1, rec.quality2) < QUALITY_MIN
+        self.off_surface = self.off_surface + 1 if off else 0
+        self.off_untracked = off and (self.off_untracked or self.unsure > 0)
+        if (self.off_untracked and self.off_surface >= EARLY_LIFT_FRAMES
+                and self.frame_no < EARLY_LIFT_WITHIN):
+            self.early_lift = True
+        if self.early_lift and not off:
+            restarts = self.restarts
+            self.reset()
+            if self.started:
+                self.mapper.start()
+            self.restarts = restarts + 1
         pending, self.pending = self.pending, (rec, rgb)
         if pending is None:
             return False

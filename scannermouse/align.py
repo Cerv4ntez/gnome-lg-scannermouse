@@ -84,3 +84,67 @@ def solve(poses, edges):
     out = np.vstack([poses[0], x.reshape(-1, 3)])
     out[:, 2] = (out[:, 2] + np.pi) % (2 * np.pi) - np.pi
     return out
+
+
+def solve_lines(poses, edges, pieces, n_lines):
+    """As `solve`, plus straight lines: `pieces` are (segment, ends, line) with the two
+    end points of a line segment in that segment's frame (centred coordinates, (2, 2)),
+    and `line` the index of the straight line on the page it belongs to. Every piece
+    is pulled onto its line; the lines' positions are solved too. Node 0 is fixed."""
+    poses = np.asarray(poses, float)
+    n = len(poses)
+    I = np.array([e[0] for e in edges])
+    J = np.array([e[1] for e in edges])
+    meas = np.array([e[2] for e in edges], float)
+    wgt = np.array([e[3] for e in edges], float)[:, None]
+    seg = np.array([p[0] for p in pieces])
+    ends = np.array([p[1] for p in pieces], float)
+    line = np.array([p[2] for p in pieces])
+
+    def world(p):
+        c, s = np.cos(p[seg, 2])[:, None], np.sin(p[seg, 2])[:, None]
+        return (c * ends[:, :, 0] - s * ends[:, :, 1] + p[seg, 0][:, None],
+                s * ends[:, :, 0] + c * ends[:, :, 1] + p[seg, 1][:, None])
+
+    # starting lines: direction and offset fitted to their pieces
+    wx, wy = world(poses)
+    start = []
+    for k in range(n_lines):
+        pts = np.c_[wx[line == k].ravel(), wy[line == k].ravel()]
+        centre = pts.mean(0)
+        u = np.linalg.svd(pts - centre)[2][0]
+        phi = math.atan2(u[1], u[0])
+        start.append((phi, -math.sin(phi) * centre[0] + math.cos(phi) * centre[1]))
+
+    def unpack(x):
+        return np.vstack([poses[0], x[:3 * (n - 1)].reshape(-1, 3)]), x[3 * (n - 1):].reshape(-1, 2)
+
+    def residuals(x):
+        p, L = unpack(x)
+        d = p[J, :2] - p[I, :2]
+        c, s = np.cos(p[I, 2]), np.sin(p[I, 2])
+        r = np.empty((len(edges), 3))
+        r[:, 0] = c * d[:, 0] + s * d[:, 1] - meas[:, 0]
+        r[:, 1] = -s * d[:, 0] + c * d[:, 1] - meas[:, 1]
+        r[:, 2] = ((p[J, 2] - p[I, 2] - meas[:, 2] + np.pi) % (2 * np.pi) - np.pi) * ANGLE_SCALE
+        wx, wy = world(p)
+        phi, rho = L[line, 0][:, None], L[line, 1][:, None]
+        off = -np.sin(phi) * wx + np.cos(phi) * wy - rho    # distance of each end point from its line
+        return np.r_[(wgt * r).ravel(), off.ravel()]
+
+    rows_e, rows_l = 3 * len(edges), 2 * len(pieces)
+    sparsity = sparse.lil_matrix((rows_e + rows_l, 3 * (n - 1) + 2 * n_lines), dtype=np.uint8)
+    for e, (i, j) in enumerate(zip(I, J)):
+        for node in (i, j):
+            if node > 0:
+                sparsity[3 * e:3 * e + 3, 3 * (node - 1):3 * node] = 1
+    for q, (k, l) in enumerate(zip(seg, line)):
+        if k > 0:
+            sparsity[rows_e + 2 * q:rows_e + 2 * q + 2, 3 * (k - 1):3 * k] = 1
+        sparsity[rows_e + 2 * q:rows_e + 2 * q + 2, 3 * (n - 1) + 2 * l:3 * (n - 1) + 2 * l + 2] = 1
+    x = np.r_[poses[1:].ravel(), np.array(start).ravel()]
+    x = optimize.least_squares(residuals, x, jac_sparsity=sparsity, loss='soft_l1', f_scale=OUTLIER_PX / 2,
+                               x_scale='jac', method='trf', max_nfev=200).x
+    out = unpack(x)[0]
+    out[:, 2] = (out[:, 2] + np.pi) % (2 * np.pi) - np.pi
+    return out

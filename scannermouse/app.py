@@ -830,6 +830,8 @@ class Window(Adw.ApplicationWindow):
         if left_out:
             reasons = ', '.join(f'{n} {why}' for why, n in left_out.most_common())
             text += f' · left out of best page: {reasons}'
+        if self.stitcher.restarts:
+            text += ' · started afresh where the mouse was put down after a lift'
         return text
 
     def _toast(self, text):

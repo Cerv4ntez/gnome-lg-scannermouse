@@ -25,7 +25,8 @@ Your user must be able to open the scanner's `/dev/videoN` node (the `video` gro
 
 ## Use
 
-1. Put the mouse on the page and press **Start Scan**.
+1. Put the mouse on the page and press **Start Scan**. If you lift it within the first
+   two seconds to reposition it, the scan starts afresh where you put it down.
 2. Sweep slowly over the page. The mouse stops moving the cursor while scanning. A
    dot next to the live view shows the speed: green is fine, yellow is getting
    fast, red means slow down.
@@ -121,6 +122,9 @@ The protocol below was recovered from the vendor driver DLLs.
   - **Snapping.** Keyframes are kept as the scan proceeds. When a sweep comes back
     over an area scanned earlier, the frame is matched to those keyframes and placed
     exactly, so drift doesn't accumulate.
+  - **Early lift.** If both sensors lose the surface and the image loses track
+    within the first 2 s, the scan restarts where the mouse is put down: what was
+    scanned before can't be placed reliably relative to it.
   - **Unknown position.** A frame is only painted when its position is known.
     After the mouse is lifted, it is matched against all keyframes to find the spot
     before painting resumes.
@@ -164,6 +168,15 @@ The protocol below was recovered from the vendor driver DLLs.
     it agrees with it. That keeps out stray patches and blank segments lying over
     text, and where no segment qualifies, the averaged page shows through. Live tracking continues from the
     corrected positions, so the page gets more accurate as the scan goes on.
+  - **Straight lines.** In the final pass, long straight lines (a photo's edge, ruled
+    lines) are detected in the segments with OpenCV's line segment detector. Pieces
+    seen in at least 4 segments that lie on one line spanning 400 px or more are
+    grouped, also across a step of up to 40 px where a sweep is misplaced, as long as
+    the parts follow each other rather than run side by side. The positions are then
+    solved again with every piece pulled onto its line, which removes bends that build
+    up along sweeps that overlap too little to be tied together. The result is kept
+    only if the overlaps still fit (median within 1 px). On four photo-strip scans
+    this made the strip edge straight to 0.4 px (median) from 3–10 px.
   - **On stop,** a final registration pass and rebuild run over everything.
 
 Selector 3 of the same unit reads and writes the firmware flash. The app never uses it.
