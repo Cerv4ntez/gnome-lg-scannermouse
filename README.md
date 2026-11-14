@@ -174,8 +174,8 @@ The protocol below was recovered from the vendor driver DLLs.
   - **Straight lines.** In the final pass, long straight lines (a photo's edge, ruled
     lines) are detected in the segments with OpenCV's line segment detector. Pieces
     seen in at least 4 segments that lie on one line spanning 400 px or more are
-    grouped, also across a step of up to 40 px where a sweep is misplaced, as long as
-    the parts follow each other rather than run side by side. The positions are then
+    grouped, also across a step of up to 40 px and a turn of up to 8° where a sweep is
+    misplaced, as long as the parts follow each other rather than run side by side. The positions are then
     solved again with every piece pulled onto its line, which removes bends that build
     up along sweeps that overlap too little to be tied together. The result is kept
     only if the overlaps still fit (median within 1 px). On four photo-strip scans

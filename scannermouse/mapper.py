@@ -73,7 +73,9 @@ RATIO = 0.8
 LINE_MIN_LENGTH = 80          # px within a segment
 LINE_GROUP_ANGLE = math.radians(2.0)   # pieces of one line differ in direction by at most this ...
 LINE_GROUP_PX = 12            # ... and in position by at most this
-LINE_JOIN_PX = 40             # parts of one line broken by a misplaced sweep may be this far apart,
+LINE_JOIN_PX = 40             # parts of one line broken by a misplaced sweep may be this far apart
+LINE_JOIN_ANGLE = math.radians(8.0)    # ... and turned by this much (the misplaced part is often turned),
+LINE_JOIN_GAP = 300           # ... with at most this gap between their ends,
 LINE_JOIN_OVERLAP = 30        # ... if they follow each other along the line (overlapping by at
                               # most this many px); parallel lines run side by side instead
 LINE_MIN_SPAN = 400           # px a line must cover on the page
@@ -473,31 +475,33 @@ def _group_lines(pieces, poses):
 
 def _join_broken(groups, world):
     """Join groups that are parts of one line broken by a misplaced sweep: nearly the
-    same direction, close, and one following the other along the line."""
+    same direction, one following the other along the line, and their facing ends
+    close together."""
     def fit(members):
         pts = world[members].reshape(-1, 2)
         centre = pts.mean(0)
         u = np.linalg.svd(pts - centre)[2][0]
         along = (pts - centre) @ u
-        return centre, u, along.min(), along.max()
+        return pts, centre, u, centre + along.min() * u, centre + along.max() * u
     joined = True
     while joined:
         joined = False
         for a in range(len(groups)):
-            ca, ua, _, _ = fit(groups[a])
+            pa, ca, ua, a0, a1 = fit(groups[a])
             for b in range(a + 1, len(groups)):
-                cb, ub, _, _ = fit(groups[b])
-                if math.acos(min(1.0, abs(float(ua @ ub)))) > LINE_GROUP_ANGLE:
+                pb, cb, ub, b0, b1 = fit(groups[b])
+                if math.acos(min(1.0, abs(float(ua @ ub)))) > LINE_JOIN_ANGLE:
                     continue
+                # extents along a's direction: side by side means two different lines
+                ta, tb = (pa - ca) @ ua, (pb - ca) @ ua
+                if min(ta.max(), tb.max()) - max(ta.min(), tb.min()) > LINE_JOIN_OVERLAP:
+                    continue
+                # the facing ends: close across the line, and not too far along it
+                ea, eb = min(((p, q) for p in (a0, a1) for q in (b0, b1)),
+                             key=lambda pq: np.linalg.norm(pq[0] - pq[1]))
                 normal = np.array([-ua[1], ua[0]])
-                if abs(float((cb - ca) @ normal)) > LINE_JOIN_PX:
+                if abs(float((eb - ea) @ normal)) > LINE_JOIN_PX or abs(float((eb - ea) @ ua)) > LINE_JOIN_GAP:
                     continue
-                # extents of both along a's direction
-                pa = (world[groups[a]].reshape(-1, 2) - ca) @ ua
-                pb = (world[groups[b]].reshape(-1, 2) - ca) @ ua
-                overlap = min(pa.max(), pb.max()) - max(pa.min(), pb.min())
-                if overlap > LINE_JOIN_OVERLAP:
-                    continue                    # side by side: two different lines
                 groups[a] = groups[a] + groups[b]
                 del groups[b]
                 joined = True
