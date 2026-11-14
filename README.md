@@ -136,6 +136,11 @@ The protocol below was recovered from the vendor driver DLLs.
     sensors report no surface, the scale change between frames is accumulated and
     steps are enlarged by it. A few frames that can't be matched continue the last
     motion instead of losing it.
+  - **LED reflections.** On glossy photos the LEDs are reflected into the camera as four
+    bright spots at fixed places along the top edge of the frame. Painted from every
+    frame, they turned smooth dark areas such as hair into rows of rungs, and as image
+    features they stand still while the page moves. They are left out of painting and
+    feature detection (2.9% of the frame).
   - **Stalled sensor.** Both sensors sit on the same rigid mouse, so they report
     similar motion. Over dark, glossy areas one of them can stall, reporting next to
     nothing while still claiming a usable surface. If one reports less than 30% of the

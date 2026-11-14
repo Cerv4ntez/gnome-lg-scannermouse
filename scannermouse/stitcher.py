@@ -125,6 +125,24 @@ ILLUMINATION = {                      # (power of u, power of v): coefficient
 }
 
 
+# On glossy photos the LEDs are reflected into the camera as four bright spots at fixed
+# places along the top edge of the frame. Painted from every frame, they turned smooth dark
+# areas (hair) into rows of rungs; and matched as features they stand still while the page
+# moves. They are left out of both. (x, y) in the cropped frame, from the dark frames of
+# three photo scans.
+GLARE_SPOTS = ((132, 5), (226, 4), (402, 4), (497, 4))
+GLARE_RADIUS = 24             # px, a little more than the spots' extent
+
+
+@functools.cache
+def glare_mask(h, w):
+    """1 where the frame shows the page, 0 at the LED reflections (soft-edged)."""
+    keep = np.ones((h, w), np.float32)
+    for x, y in GLARE_SPOTS:
+        cv2.circle(keep, (x, y), GLARE_RADIUS, 0.0, -1)
+    return np.minimum(keep, cv2.GaussianBlur(keep, (0, 0), 3))
+
+
 @functools.cache
 def _illumination(h, w):
     """The LED's brightness over a cropped frame, 1 at its brightest point."""
@@ -134,11 +152,14 @@ def _illumination(h, w):
     return light / light.max()
 
 
+@functools.cache
 def _edge_weight(h, w, ramp=32):
-    """Feathering mask: 1 in the middle, ramping down towards the frame edges."""
+    """Feathering mask: 1 in the middle, ramping down towards the frame edges, and 0
+    at the LED reflections."""
     ys = np.minimum(np.arange(h), np.arange(h)[::-1]) + 1
     xs = np.minimum(np.arange(w), np.arange(w)[::-1]) + 1
-    return np.minimum.outer(np.minimum(ys, ramp), np.minimum(xs, ramp)).astype(np.float32) / ramp
+    edges = np.minimum.outer(np.minimum(ys, ramp), np.minimum(xs, ramp)).astype(np.float32) / ramp
+    return edges * glare_mask(h, w)
 
 
 def _rot(theta):
@@ -177,7 +198,8 @@ class Features:
         if Features._orb is None:
             Features._orb = cv2.ORB_create(ORB_FEATURES, fastThreshold=8)
             Features._matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-        kps, self.desc = Features._orb.detectAndCompute(gray, None)
+        keep = (glare_mask(*gray.shape) > 0.5).astype(np.uint8)
+        kps, self.desc = Features._orb.detectAndCompute(gray, keep)
         self.last_scale = 1.0
         self.pts = np.float32([k.pt for k in kps]) if kps else np.zeros((0, 2), np.float32)
         self.centre = np.array([(gray.shape[1] - 1) / 2, (gray.shape[0] - 1) / 2])

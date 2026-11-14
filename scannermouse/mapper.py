@@ -124,7 +124,11 @@ class Segment:
         self.img = img                # uint8 normalised frame
         self.sharpness = sharpness    # local sharpness map (reduced size), or None if not usable
         self.feats = feats            # stitcher.Features (ORB)
-        self.xfeats = xfeat.XFeatures(img) if xfeat.available() else None
+        if xfeat.available():
+            from .stitcher import glare_mask
+            self.xfeats = xfeat.XFeatures(img, glare_mask(*img.shape))
+        else:
+            self.xfeats = None
         self.confidence = confidence  # placement confidence from the live tracker, 0..1
         self.reason = reason          # why it isn't used on the best-frame page, or None
 

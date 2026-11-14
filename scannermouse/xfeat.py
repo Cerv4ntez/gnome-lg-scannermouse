@@ -53,7 +53,8 @@ def _bilinear(a, fx, fy):
 class XFeatures:
     """Keypoints (N, 2, frame pixels) and unit descriptors (N, 64) of one frame."""
 
-    def __init__(self, gray):
+    def __init__(self, gray, keep=None):
+        """`keep`: optional (h, w) map, keypoints only where it is above 0.5."""
         h0, w0 = gray.shape
         w, h = INPUT_SIZE
         img = cv2.resize(gray.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
@@ -72,7 +73,11 @@ class XFeatures:
         # feature-map coordinates as in the reference (grid_sample, align_corners=False)
         fx, fy = xs * (w // 8) / (w - 1) - 0.5, ys * (h // 8) / (h - 1) - 0.5
         scores = hm[ys, xs] * _bilinear(heat, fx, fy)
+        if keep is not None:
+            scores[keep[np.minimum(ys * h0 // h, h0 - 1), np.minimum(xs * w0 // w, w0 - 1)] <= 0.5] = 0
+            scores[scores == 0] = -1
         best = np.argsort(-scores)[:TOP_K]
+        best = best[scores[best] > 0]
         desc = _bilinear(feats, fx[best], fy[best])
         self.desc = (desc / (np.linalg.norm(desc, axis=1, keepdims=True) + 1e-12)).astype(np.float32)
         self.pts = np.c_[xs[best] * w0 / w, ys[best] * h0 / h].astype(np.float32)
