@@ -103,6 +103,9 @@ The protocol below was recovered from the vendor driver DLLs.
   JPEG header: the SOF0 dimension bytes and the end of the second quantisation table.
   It holds a frame counter, X/Y counters from two motion sensors, their surface quality
   and the button state ([`framedecode.py`](scannermouse/framedecode.py)).
+- **Lighting.** The LED lights each frame unevenly, about 30% darker towards the
+  bottom. Every frame is divided by a fixed, measured profile of that light, so a
+  photo keeps its own brightness. The brightest part of the page becomes white.
 - **Stitching** ([`stitcher.py`](scannermouse/stitcher.py)) uses OpenCV ORB features.
   - **Tracking.** Each frame is matched to the previous one, which gives its movement
     and rotation. The two laser sensors are the fallback where there is too little

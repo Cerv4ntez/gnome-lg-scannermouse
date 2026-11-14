@@ -23,6 +23,7 @@ best frame there (sharpness x distance from the frame edge x confidence).
 """
 
 import collections
+import functools
 import math
 import threading
 
@@ -99,18 +100,26 @@ REFINE_MAX_ANGLE = math.radians(0.6)   # ... and turns it at most this much
 CONSENSUS_MIN = 0.4           # correlation with the averaged page a segment needs for the best page
 CONSENSUS_TEXTURE = 0.0006    # mean squared detail below which an area counts as blank
 REJECTED_WEIGHT = 0.05        # weight of rejected frames on the averaged page
-PAPER_LEVEL = 0.92            # paper is scaled to this white level in every frame
-WHITE_POINT = 0.95            # output: values above this share of the paper level become white
+WHITE_POINT = 0.95            # output: values above this share of the brightest part of the page become white
+WHITE_PERCENTILE = 99.5       # ... measured as this percentile of the scanned pixels
+
+# The LED lights the frame unevenly: brightest at the top, about 30% darker
+# towards the bottom middle. Brightness relative to the brightest point, as a
+# polynomial in u (-1 left .. 1 right) and v (-1 top .. 1 bottom) of the cropped
+# frame; measured from the 90th percentile of each pixel over a scan of paper and
+# photos. A fixed profile keeps the page's own brightness: estimating the light
+# from the image itself turns the dark parts of a photo grey.
+ILLUMINATION = {(0, 0): 0.7581, (0, 1): -0.1125, (0, 2): 0.0947,      # (power of u, power of v): coefficient
+                (1, 0): -0.0022, (1, 1): -0.0021, (2, 0): 0.0991}
 
 
-def _box_blur(img, k):
-    """Separable box blur via cumulative sums, edge-padded."""
-    r = k // 2
-    p = np.pad(img, r, mode='edge')
-    c = np.cumsum(np.cumsum(p, axis=0), axis=1)
-    c = np.pad(c, ((1, 0), (1, 0)))
-    h, w = img.shape
-    return (c[k:k + h, k:k + w] - c[:h, k:k + w] - c[k:k + h, :w] + c[:h, :w]) / (k * k)
+@functools.cache
+def _illumination(h, w):
+    """The LED's brightness over a cropped frame, 1 at its brightest point."""
+    v, u = np.mgrid[0:h, 0:w].astype(np.float32)
+    u, v = (u - (w - 1) / 2) / (w / 2), (v - (h - 1) / 2) / (h / 2)
+    light = sum(c * u ** i * v ** j for (i, j), c in ILLUMINATION.items())
+    return light / light.max()
 
 
 def _edge_weight(h, w, ramp=32):
@@ -352,9 +361,10 @@ class Canvas:
             img = np.where(chosen, self.best[y0:y1:step, x0:x1:step], img)
         if not covered.any():
             return None
-        # the sensor sees the page mirrored; paper to white: slight unevenness in
-        # the paper clips away, text keeps its contrast
-        img = img[:, ::-1] / (WHITE_POINT * PAPER_LEVEL)
+        # the sensor sees the page mirrored; the brightest part of the page (paper,
+        # or a photo's highlights) to white: slight unevenness in the paper clips away
+        white = WHITE_POINT * float(np.percentile(img[covered], WHITE_PERCENTILE))
+        img = img[:, ::-1] / max(white, 1e-3)
         img = np.ascontiguousarray((img * 255).clip(0, 255).astype(np.uint8))
         return img, np.ascontiguousarray(covered[:, ::-1]), 1.0 / step
 
@@ -404,7 +414,6 @@ class Stitcher:
             self.pose = np.zeros(3)            # x, y of the frame centre in world coords; rotation (rad)
             self.last = None                   # previous MouseRecord
             self.pending = None                # (record, rgb) held back one frame
-            self.illum = None                  # running illumination estimate
             self.prev = None                   # (pose, Features) of the last frame
             self.keyframes = []                # (segment, Features, frame number)
             self.link = None                   # tracked motion since the last segment: [pose, weight] or None
@@ -472,19 +481,10 @@ class Stitcher:
     # -- image processing --------------------------------------------------
 
     def _normalise(self, green):
-        """Flatten the LED illumination so paper comes out uniformly white."""
-        img = green[CROP_TOP:].astype(np.float32)
-        blur = _box_blur(img, 41)
-        if self.illum is None:
-            self.illum = blur
-        else:
-            self.illum += 0.05 * (blur - self.illum)
-        flat = img / np.maximum(self.illum, 1.0)
-        # bring this frame's paper to the common white level, so neighbouring
-        # frames don't differ in brightness (bounded, for frames that are mostly dark)
-        paper = float(np.percentile(flat[::4, ::4], 90))
-        gain = float(np.clip(PAPER_LEVEL / max(paper, 1e-3), 0.8, 1.25))
-        return np.clip(flat * gain, 0.0, 1.0)
+        """Flatten the LED illumination (0..1, where 1 is a white page at the
+        brightest point of the light)."""
+        img = green[CROP_TOP:].astype(np.float32) / 255
+        return np.clip(img / _illumination(*img.shape), 0.0, 1.0)
 
     def _snap(self, feats, img, guess):
         """Match older keyframes near `guess` (or all of them if guess is None).
