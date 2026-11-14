@@ -36,7 +36,7 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 
-from . import align
+from . import align, xfeat
 
 GAP = 15                      # segments apart before a match counts as an overlap (not a neighbour)
 NEAR_RADIUS = 600             # px; segments this close to the current estimate are tried
@@ -46,7 +46,16 @@ LOOKUP_TRIES = 3              # candidates per segment from feature lookup
 LOOKUP_FEATURES = 300         # strongest features per segment in the lookup table
 LOOKUP_EVERY = 3              # every n-th segment goes into the lookup table
 LOOKUP_VOTES = 15             # feature votes needed for a lookup candidate
-MATCH_INLIERS = 40            # geometric verification for an overlap
+MATCH_INLIERS = 40            # geometric verification for an overlap (ORB)
+XFEAT_INLIERS = 20            # ... with XFeat, whose matches are fewer but more reliable
+XFEAT_INLIER_VALUE = 3        # an XFeat inlier counts as much as this many ORB inliers for the weight
+XFEAT_LOOKUP_FEATURES = 200   # strongest XFeat features per segment in the lookup table
+XFEAT_LOOKUP_SIMILARITY = 0.9 # a lookup vote needs at least this descriptor similarity
+# XFeat also matches different places with similar content (the pictures of a photo-booth
+# strip), so an XFeat overlap only counts once a neighbouring pair of segments confirms
+# the same correction, as in loop-closure checks
+CONFIRM_SPAN = 4              # segments the confirming pair may be away, at either end
+CONFIRM_PX = 5                # px the two corrections may differ
 OVERLAP_MIN_AREA = 0.15       # share of the frame two segments must overlap to be linked
 OVERLAP_MIN_CORRELATION = 0.15  # correlation over the whole overlap for a link to count (fast,
                               # blurred scans give true overlaps as low as ~0.2; misfits stay near 0)
@@ -95,12 +104,13 @@ def overlap_agrees(img, ref, rel):
 
 
 class Segment:
-    __slots__ = ('img', 'sharpness', 'feats', 'confidence', 'reason')
+    __slots__ = ('img', 'sharpness', 'feats', 'xfeats', 'confidence', 'reason')
 
     def __init__(self, img, sharpness, feats, confidence, reason):
         self.img = img                # uint8 normalised frame
         self.sharpness = sharpness    # local sharpness map (reduced size), or None if not usable
-        self.feats = feats            # stitcher.Features
+        self.feats = feats            # stitcher.Features (ORB)
+        self.xfeats = xfeat.XFeatures(img) if xfeat.available() else None
         self.confidence = confidence  # placement confidence from the live tracker, 0..1
         self.reason = reason          # why it isn't used on the best-frame page, or None
 
@@ -115,10 +125,12 @@ class Mapper:
         self.poses = []                         # current best positions, (x, y, theta)
         self.edges = []                         # (i, j, pose of j relative to i, weight)
         self.tested = set()
+        self.unconfirmed = []                   # XFeat overlaps waiting for a confirming neighbour
         self.fit = []                           # per segment: True / False (misplaced) / None (unknown)
         self.pending = collections.deque()      # segments not yet searched for overlaps
         self.recheck = 0                        # round-robin position for re-checking old segments
-        self.lookup = []                        # (segment, strongest descriptors)
+        self.lookup = []                        # (segment, strongest ORB descriptors)
+        self.xlookup = []                       # (segment, strongest XFeat descriptors)
         self.pose_version = 0
         self.rendered = None                    # (pose version, number of segments, canvases)
         self.stats = collections.Counter()
@@ -222,7 +234,7 @@ class Mapper:
             seg = self.segments[i]
             here = self.poses[i][:2].copy()
             centres = np.array([p[:2] for p in self.poses[:max(i - GAP, 0)]])
-        if seg.feats.desc is None:
+        if seg.feats.desc is None and seg.xfeats is None:
             return
         cands = []
         if len(centres):
@@ -234,14 +246,24 @@ class Mapper:
                     cands.append(int(j))
         if lookup:
             cands += [j for j in self._lookup(i, seg) if j not in cands]
+            cands += [j for j in self._xlookup(i, seg) if j not in cands]
             if i % LOOKUP_EVERY == 0:
-                self.lookup.append((i, seg.feats.desc[:LOOKUP_FEATURES]))
+                if seg.feats.desc is not None:
+                    self.lookup.append((i, seg.feats.desc[:LOOKUP_FEATURES]))
+                if seg.xfeats is not None:
+                    self.xlookup.append((i, seg.xfeats.desc[:XFEAT_LOOKUP_FEATURES]))
         for j in cands:
             if (j, i) in self.tested:
                 continue
             self.tested.add((j, i))
-            rel, inliers = seg.feats.relative_to(self.segments[j].feats, MATCH_INLIERS)
             self.stats['tested'] += 1
+            rel, by_xfeat = None, False
+            if seg.xfeats is not None and self.segments[j].xfeats is not None:
+                rel, inliers = seg.xfeats.relative_to(self.segments[j].xfeats, XFEAT_INLIERS)
+                inliers *= XFEAT_INLIER_VALUE
+                by_xfeat = rel is not None
+            if rel is None and seg.feats.desc is not None:
+                rel, inliers = seg.feats.relative_to(self.segments[j].feats, MATCH_INLIERS)
             if rel is None:
                 continue
             if self.linked[i]:
@@ -253,12 +275,45 @@ class Mapper:
             if not overlap_agrees(seg.img, self.segments[j].img, rel):
                 self.stats['repeats rejected'] += 1
                 continue
-            with self.lock:
-                self.edges.append((j, i, rel, _weight(inliers)))
-            self.stats['overlaps'] += 1
+            edge = (j, i, rel, _weight(inliers))
+            for e in (self._confirmed(edge) if by_xfeat else [edge]):
+                with self.lock:
+                    self.edges.append(e)
+                self.stats['overlaps'] += 1
+
+    def _confirmed(self, edge):
+        """The XFeat overlaps that can be used now: this one and a waiting neighbour if
+        they agree on the correction to the current positions, else none (it waits)."""
+        j, i, rel = edge[:3]
+        with self.lock:
+            fix = rel[:2] - align.relative(self.poses[j], self.poses[i])[:2]
+        for n, (other, other_fix, used) in enumerate(self.unconfirmed):
+            oj, oi = other[:2]
+            if (abs(oi - i) <= CONFIRM_SPAN and abs(oj - j) <= CONFIRM_SPAN
+                    and np.hypot(*(fix - other_fix)) <= CONFIRM_PX):
+                self.unconfirmed[n] = (other, other_fix, True)
+                self.unconfirmed.append((edge, fix, True))
+                return [edge] if used else [edge, other]
+        self.unconfirmed.append((edge, fix, False))
+        self.stats['unconfirmed'] += 1
+        return []
+
+    def _xlookup(self, i, seg):
+        """As _lookup, with XFeat descriptors (cosine similarity)."""
+        entries = [(k, d) for k, d in self.xlookup if k < i - GAP]
+        if not entries or seg.xfeats is None or len(seg.xfeats.desc) == 0:
+            return []
+        table = np.vstack([d for _, d in entries])
+        owner = np.concatenate([np.full(len(d), k) for k, d in entries])
+        limit = math.sqrt(2 * (1 - XFEAT_LOOKUP_SIMILARITY))     # unit vectors: cos = 1 - d^2 / 2
+        nearest = cv2.BFMatcher(cv2.NORM_L2).match(seg.xfeats.desc[:XFEAT_LOOKUP_FEATURES], table)
+        votes = collections.Counter(int(owner[m.trainIdx]) for m in nearest if m.distance < limit)
+        return [k for k, v in votes.most_common(LOOKUP_TRIES) if v >= LOOKUP_VOTES]
 
     def _lookup(self, i, seg):
         """Older segments sharing many features with segment i, wherever they are."""
+        if seg.feats.desc is None:
+            return []
         entries = [(k, d) for k, d in self.lookup if k < i - GAP]
         if not entries:
             return []
@@ -350,6 +405,7 @@ def _take_canvas(shared):
 def _worker(inbox, outbox):
     """Main loop of the background process: one Mapper per scan."""
     from .stitcher import render_segments
+    cv2.setNumThreads(4)                        # leave the cores to live tracking
     mapper, scan = None, None
 
     def watch(parent):

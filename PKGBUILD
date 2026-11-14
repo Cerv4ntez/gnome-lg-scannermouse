@@ -1,11 +1,11 @@
 # Maintainer: Cerv4ntez <18594385+Cerv4ntez@users.noreply.github.com>
 pkgname=gnome-lg-scannermouse
-pkgver=0.1.5
+pkgver=0.1.6
 pkgrel=1
 pkgdesc='GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)'
 arch=('any')
 url='https://github.com/Cerv4ntez/gnome-lg-scannermouse'
-license=('GPL-3.0-or-later')
+license=('GPL-3.0-or-later' 'Apache-2.0')  # Apache-2.0: the bundled XFeat model
 depends=('python' 'python-gobject' 'python-cairo' 'python-numpy' 'python-scipy' 'python-opencv'
          'gtk4' 'libadwaita' 'gstreamer' 'gst-plugins-base' 'gst-plugins-good')
 makedepends=('git' 'python-build' 'python-installer' 'python-setuptools' 'python-wheel')

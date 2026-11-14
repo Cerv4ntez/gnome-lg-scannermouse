@@ -141,6 +141,15 @@ The protocol below was recovered from the vendor driver DLLs.
     positions that agree best with all matches
     ([`align.py`](scannermouse/align.py)), down-weighting outliers. Segments that
     still disagree with their neighbours are marked as not fitting.
+  - **Learned features** ([`xfeat.py`](scannermouse/xfeat.py)). Overlaps are matched
+    with [XFeat](https://github.com/verlab/accelerated_features) (CVPR 2024) first, ORB
+    as the fallback. Where sweeps overlap in dark or low-contrast areas, as on photos,
+    ORB verified 0–5 of the overlapping pairs on test scans and XFeat 6–37. The network
+    runs in OpenCV's DNN module, about 8 ms per segment;
+    [`tools/xfeat_onnx.py`](tools/xfeat_onnx.py) builds the model file from the
+    authors' weights without PyTorch. XFeat also matches different places that look
+    alike (the pictures of a photo-booth strip), so an XFeat overlap only counts once a
+    neighbouring pair of segments confirms the same correction.
   - **Repeated text.** Documents repeat words, and most feature matches between
     non-neighbouring segments link *different* places that share words: 83% on one
     test scan. Three checks keep them out:
@@ -172,4 +181,7 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE).
+GPL-3.0-or-later, see [LICENSE](LICENSE). The bundled XFeat model
+(`scannermouse/data/xfeat.onnx`) is converted from the weights of
+[verlab/accelerated_features](https://github.com/verlab/accelerated_features),
+Apache-2.0, see [LICENSE-XFeat](scannermouse/data/LICENSE-XFeat).
