@@ -74,6 +74,7 @@ LOST_AFTER = 4                # unplaceable frames in a row before the position 
 RELOCATE_EVERY = 3            # while lost, search all keyframes on every n-th frame
 RESUME_AFTER = 8              # tracked frames before painting resumes on new ground after a lift
 SEGMENT_SPACING = 8           # px a frame must move to be kept as a segment
+STILL_DIFF = 0.015            # mean change between frames (of white) below which the image stands still
 SENSOR_LINK_WEIGHT = 0.1      # trust in a segment link that relied on the sensors
 # Speed shown while scanning. Fast frames are still used: once tracking is checked
 # against the sensors they are placed as well as slow ones, and leaving them out
@@ -451,6 +452,7 @@ class Stitcher:
             self.snap_scale = 1.0
             self.magnification = 1.0           # page px per px of the last frame (above 1 while lifted)
             self.velocity = None               # last step, carried on over frames that can't be matched
+            self.prev_small = None             # previous frame, reduced, to tell when the mouse stands still
 
     def start(self):
         """Start the background re-registration and re-composition."""
@@ -664,6 +666,16 @@ class Stitcher:
                                                            1 / MAGNIFICATION_MAX, MAGNIFICATION_MAX))
             if step is None and sensor_step is not None and self.prev is not None:
                 step, source, weight = sensor_step, 'sensor', SENSOR_LINK_WEIGHT
+            # Paused over a featureless area (a photo's dark background): the sensors
+            # report no motion, which on glossy surfaces can also mean they don't
+            # track, but the image standing still confirms it. Without this the
+            # position would count as lost, and the motion after the pause be dropped.
+            small = img[::4, ::4]
+            if (step is None and self.prev is not None and sensor is not None and not np.any(sensor[0])
+                    and self.prev_small is not None
+                    and float(np.abs(small - self.prev_small).mean()) < STILL_DIFF):
+                step, source, weight = np.zeros(3), 'still', SENSOR_LINK_WEIGHT
+            self.prev_small = small
             if step is not None:
                 self.velocity = step
             pose = compose(self.prev[0], step) if step is not None else None
@@ -695,10 +707,13 @@ class Stitcher:
             elif pose is not None:
                 self.link = None
 
-            # keep tracking relative to this frame even when it isn't painted; until the
-            # position counts as lost, assume the motion went on as before
+            # keep tracking relative to this frame even when it isn't painted: while
+            # lost, from the measured motion (so painting resumes in the right place);
+            # until then, assume the motion went on as before
             if pose is not None:
                 ref = pose
+            elif self.lost and step is not None and self.prev is not None:
+                ref = compose(self.prev[0], step)
             elif self.prev is not None and self.velocity is not None and not self.lost and self.unsure < LOST_AFTER:
                 ref = compose(self.prev[0], self.velocity)
             else:

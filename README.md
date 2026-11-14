@@ -125,6 +125,9 @@ The protocol below was recovered from the vendor driver DLLs.
   - **Early lift.** If both sensors lose the surface and the image loses track
     within the first 2 s, the scan restarts where the mouse is put down: what was
     scanned before can't be placed reliably relative to it.
+  - **Pauses.** Over a featureless area (a photo's dark background) with the sensors
+    reporting no motion, an image that stands still confirms the mouse is resting, so
+    the position stays known and the motion after the pause is counted.
   - **Unknown position.** A frame is only painted when its position is known.
     After the mouse is lifted, it is matched against all keyframes to find the spot
     before painting resumes.
@@ -185,6 +188,10 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 
 - The sensor fallback's constants were calibrated from one 40 s test scan. They are
   not read from the calibration data stored in the mouse's EEPROM.
+- Over large dark areas of glossy photos, the camera finds nothing to track and the
+  sensors can under-count the motion by up to half, so such a stretch can come out
+  compressed. Sweeping so that each frame also covers some detail (a face, an edge)
+  avoids it.
 - Keep the mouse on the page. If it is lifted and set down somewhere the keyframes
   don't cover, scanning continues from a best guess.
 - The raw frames of the last 3 scans are kept in `~/.cache/scannermouse/`, so a problem
