@@ -36,6 +36,7 @@ ANALYSE_EVERY = 1.0   # s between text/skew measurements of the live preview
 PREVIEW_EVERY = 0.4   # s between preview updates while scanning
 CONTRAST_MAX = 2.5    # contrast setting: 1 leaves the page as scanned
 CONTRAST_DEFAULT = 1.5
+PHOTO_CONTRAST_DEFAULT = 1.0   # photos come out as scanned
 ZOOM_MAX = 8.0        # times the size that fits the window
 ZOOM_STEP = 1.25      # per mouse-wheel notch
 SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), 'scannermouse', 'settings.json')
@@ -59,7 +60,8 @@ def _new_recording():
 
 def _load_settings():
     settings = {'auto_exposure': True, 'exposure': EXPOSURE_DEFAULT, 'best_frames': True,
-                'straighten': True, 'clean_background': True, 'contrast': CONTRAST_DEFAULT}
+                'straighten': True, 'clean_background': True, 'contrast': CONTRAST_DEFAULT,
+                'mode': 'text', 'photo_contrast': PHOTO_CONTRAST_DEFAULT}
     try:
         with open(SETTINGS_FILE) as f:
             settings.update(json.load(f))
@@ -141,8 +143,21 @@ class Window(Adw.ApplicationWindow):
         self.exposure_scale.add_mark(EXPOSURE_DEFAULT, Gtk.PositionType.BOTTOM, None)
         self.auto_switch.connect('notify::active', lambda *_: self._settings_changed())
         self.exposure_scale.connect('value-changed', lambda *_: self._settings_changed())
+        # scanning mode: text pages get straightened, cleaned and recognised; photos
+        # are left as scanned. Only processing differs, so it can be switched at any time.
+        self.text_radio = Gtk.CheckButton(label='Text', active=self.settings['mode'] == 'text')
+        self.photo_radio = Gtk.CheckButton(label='Photo', active=self.settings['mode'] == 'photo',
+                                           group=self.text_radio)
+        self.text_radio.connect('toggled', lambda b: b.get_active() and self._mode_changed())
+        self.photo_radio.connect('toggled', lambda b: b.get_active() and self._mode_changed())
+        modes = Gtk.Box(spacing=12)
+        modes.append(Gtk.Label(label='Scanning mode', xalign=0, hexpand=True))
+        modes.append(self.text_radio)
+        modes.append(self.photo_radio)
         grid = Gtk.Grid(row_spacing=12, column_spacing=12, margin_top=12, margin_bottom=12,
                         margin_start=12, margin_end=12)
+        grid.attach(modes, 0, -2, 2, 1)
+        grid.attach(Gtk.Separator(), 0, -1, 2, 1)
         grid.attach(Gtk.Label(label='Automatic exposure', xalign=0, hexpand=True), 0, 0, 1, 1)
         grid.attach(self.auto_switch, 1, 0, 1, 1)
         grid.attach(Gtk.Label(label='Exposure', xalign=0), 0, 1, 2, 1)
@@ -180,7 +195,7 @@ class Window(Adw.ApplicationWindow):
         page_hint.add_css_class('caption')
         grid.attach(page_hint, 0, 10, 2, 1)
         self.contrast_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, CONTRAST_MAX, 0.1)
-        self.contrast_scale.set_value(self.settings['contrast'])
+        self.contrast_scale.set_value(self.settings[self._contrast_key()])
         self.contrast_scale.set_digits(1)
         self.contrast_scale.set_format_value_func(lambda _, v: f'{v:.1f}×')
         self.contrast_scale.add_mark(1.0, Gtk.PositionType.BOTTOM, None)
@@ -189,12 +204,11 @@ class Window(Adw.ApplicationWindow):
         grid.attach(Gtk.Separator(), 0, 11, 2, 1)
         grid.attach(Gtk.Label(label='Contrast', xalign=0), 0, 12, 2, 1)
         grid.attach(self.contrast_scale, 0, 13, 2, 1)
-        contrast_hint = Gtk.Label(label='Darkens pale text and lightens faint grey on the paper. '
-                                        '1.0× leaves the page as scanned.',
-                                  xalign=0, wrap=True, max_width_chars=36)
-        contrast_hint.add_css_class('dim-label')
-        contrast_hint.add_css_class('caption')
-        grid.attach(contrast_hint, 0, 14, 2, 1)
+        self.contrast_hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=36)
+        self.contrast_hint.add_css_class('dim-label')
+        self.contrast_hint.add_css_class('caption')
+        grid.attach(self.contrast_hint, 0, 14, 2, 1)
+        self.text_settings = [self.straighten_switch, self.clean_switch]
         self.settings_button = Gtk.MenuButton(icon_name='emblem-system-symbolic', tooltip_text='Scanner Settings',
                                               popover=Gtk.Popover(child=grid))
         header.pack_end(self.settings_button)
@@ -248,7 +262,8 @@ class Window(Adw.ApplicationWindow):
 
         self.views = Adw.ViewStack()
         self.views.add_titled_with_icon(overlay, 'scan', 'Scan', 'image-x-generic-symbolic')
-        self.views.add_titled_with_icon(self._build_text_view(), 'text', 'Text', 'text-x-generic-symbolic')
+        self.text_page = self._build_text_view()
+        self.views.add_titled_with_icon(self.text_page, 'text', 'Text', 'text-x-generic-symbolic')
         header.set_title_widget(Adw.ViewSwitcher(stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE))
 
         self.toasts = Adw.ToastOverlay(child=self.views)
@@ -261,6 +276,7 @@ class Window(Adw.ApplicationWindow):
                                            Gtk.CallbackAction.new(lambda *_: self.stop_scan() or True)))
         self.add_controller(keys)
         self.connect('close-request', self._on_close)
+        self._update_mode()
         GLib.timeout_add(150, self._refresh)
         self._update_controls()
 
@@ -350,7 +366,9 @@ class Window(Adw.ApplicationWindow):
     def _stopped(self, error):
         self.analysis = None                    # measure the finished page afresh
         self._update_controls()
-        if self.settings['straighten']:
+        if self.settings['mode'] == 'photo':
+            pass                                # no text steps for photos
+        elif self.settings['straighten']:
             # recognition follows once the page is turned upright
             threading.Thread(target=self._find_orientation, daemon=True).start()
         else:
@@ -452,8 +470,37 @@ class Window(Adw.ApplicationWindow):
         self.settings['best_frames'] = self.best_switch.get_active()
         self.settings['straighten'] = self.straighten_switch.get_active()
         self.settings['clean_background'] = self.clean_switch.get_active()
-        self.settings['contrast'] = round(self.contrast_scale.get_value(), 1)
+        self.settings[self._contrast_key()] = round(self.contrast_scale.get_value(), 1)
         _save_settings(self.settings)
+
+    def _contrast_key(self):
+        return 'contrast' if self.settings['mode'] == 'text' else 'photo_contrast'
+
+    def _mode_changed(self):
+        self.settings['mode'] = 'photo' if self.photo_radio.get_active() else 'text'
+        _save_settings(self.settings)
+        self.analysis, self.page_turns = None, 0
+        # each mode keeps its own contrast; setting the slider updates the page
+        value = self.settings[self._contrast_key()]
+        if self.contrast_scale.get_value() != value:
+            self.contrast_scale.set_value(value)
+        else:
+            self._page_changed()
+        self._update_mode()
+        if self.settings['mode'] == 'photo':
+            self._clear_text()
+        elif self.state == 'idle' and self.stitcher.frames_used:
+            self._stopped(None)                 # straighten, turn upright and recognise
+        self._show_page()
+
+    def _update_mode(self):
+        photo = self.settings['mode'] == 'photo'
+        for widget in self.text_settings:
+            widget.set_sensitive(not photo)
+        self.views.get_page(self.text_page).set_visible(not photo)
+        self.contrast_hint.set_label(
+            'Steepens the mid-tones; black and white stay as they are. 1.0× leaves the photo as scanned.'
+            if photo else 'Darkens pale text and lightens faint grey on the paper. 1.0× leaves the page as scanned.')
 
     # -- UI ---------------------------------------------------------------
 
@@ -493,7 +540,7 @@ class Window(Adw.ApplicationWindow):
 
     def _start_ocr(self):
         """Recognise the finished page as it is currently shown (background thread)."""
-        if self.state != 'idle' or self.stitcher.frames_used == 0:
+        if self.state != 'idle' or self.stitcher.frames_used == 0 or self.settings['mode'] == 'photo':
             return
         langs = ocr.languages()
         if langs is None:
@@ -559,7 +606,7 @@ class Window(Adw.ApplicationWindow):
         img, covered, scale = page
         self.render_scale = scale
         turns = self.turns
-        if self.settings['straighten'] or self.settings['clean_background']:
+        if self.settings['mode'] == 'text' and (self.settings['straighten'] or self.settings['clean_background']):
             angle, is_text = self._analyse(img, covered)
             if is_text and self.settings['straighten']:
                 img, covered = cleanup.rotate(img, covered, angle)
@@ -570,7 +617,7 @@ class Window(Adw.ApplicationWindow):
         if self.crop_button.get_active() if crop is None else crop:
             top, bottom, left, right = cleanup.crop_box(covered)
             img = img[top:bottom, left:right]
-        img = cleanup.contrast(img, self.settings['contrast'])
+        img = cleanup.contrast(img, self.settings[self._contrast_key()])
         return np.ascontiguousarray(np.rot90(img, turns))
 
     def _analyse(self, img, covered):

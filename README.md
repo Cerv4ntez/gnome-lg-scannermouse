@@ -38,6 +38,12 @@ Hold Ctrl and turn the mouse wheel to zoom into the page; the wheel alone then s
 Output is greyscale: the scanner lights the page with a green LED and the sensor
 records no usable blue, so colour cannot be recovered.
 
+**Scanning mode** (settings menu): **Text** straightens, cleans and recognises the
+page as described below. **Photo** leaves the page as scanned: no straightening,
+evening out or text recognition, and its own contrast setting (1.0× by default).
+Only the processing differs, so the mode can be switched at any time, even after
+scanning.
+
 **Best frame per area** (settings menu, on by default) chooses how frames are
 combined. Every scan builds two pages at once, so this can be switched at any time,
 even after scanning:
@@ -52,7 +58,7 @@ Frames that look blurred (lifted), show a changed magnification (tilted), come w
 both sensors off the surface, or don't match the text already scanned under them
 (misplaced) are left out of the best-frame page. The status line counts them by reason.
 
-**Text pages** ([`cleanup.py`](scannermouse/cleanup.py), settings menu, both on by default):
+**Text pages** ([`cleanup.py`](scannermouse/cleanup.py), settings menu, text mode, both on by default):
 
 - **Straighten text pages.** If the page is mostly text, it is turned so the lines
   are level. Rotated to the angle of its lines, a text page has a strongly peaked
@@ -65,7 +71,7 @@ both sensors off the surface, or don't match the text already scanned under them
   and punctuation stay. This applies to the finished page; the live preview is only
   straightened.
 
-**Text recognition** ([`ocr.py`](scannermouse/ocr.py)). After a scan, Tesseract reads
+**Text recognition** ([`ocr.py`](scannermouse/ocr.py), text mode). After a scan, Tesseract reads
 the finished page in the background. The result appears in the **Text** tab, where it
 can be edited and copied (**Copy All**), or saved as a `.txt` file.
 - **Layout:** paragraphs, blank lines, indentation, and tabs for wide gaps such as
@@ -79,7 +85,7 @@ can be edited and copied (**Copy All**), or saved as a `.txt` file.
   for German).
 - **Re-reading:** turning the page with the rotate buttons reads it again.
 
-**Contrast** (settings menu, 1.5× by default) steepens the grey levels around a light
+**Contrast** (settings menu, 1.5× by default for text, 1.0× for photos) steepens the grey levels around a light
 grey: pale text gets darker and faint grey on the paper lighter, while white paper stays
 white. The curve flattens towards black and white instead of clipping, so the shadows of
 a photo keep their detail. 1.0× leaves the page as scanned. It applies to the preview, saved files and text
