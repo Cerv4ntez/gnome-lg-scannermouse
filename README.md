@@ -136,6 +136,11 @@ The protocol below was recovered from the vendor driver DLLs.
     sensors report no surface, the scale change between frames is accumulated and
     steps are enlarged by it. A few frames that can't be matched continue the last
     motion instead of losing it.
+  - **Stalled sensor.** Both sensors sit on the same rigid mouse, so they report
+    similar motion. Over dark, glossy areas one of them can stall, reporting next to
+    nothing while still claiming a usable surface. If one reports less than 30% of the
+    other's motion, only the other is used. This happens on 2–19% of frames on photo
+    scans; before, the stalled sensor pulled the estimate down and squashed dark areas.
   - **Sensor lag.** The sensor reading in a frame lags its image by about a third of
     a frame, so frames are processed one frame late to interpolate.
 - **Continuous re-registration** ([`mapper.py`](scannermouse/mapper.py)). Every
@@ -188,9 +193,9 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 
 - The sensor fallback's constants were calibrated from one 40 s test scan. They are
   not read from the calibration data stored in the mouse's EEPROM.
-- Over large dark areas of glossy photos, the camera finds nothing to track and the
-  sensors can under-count the motion by up to half, so such a stretch can come out
-  compressed. Sweeping so that each frame also covers some detail (a face, an edge)
+- Over large dark areas of glossy photos, the camera finds nothing to track (only the
+  LED's reflections, which stay in place), and the sensors can under-count the motion,
+  so such a stretch can come out compressed. Sweeping so that each frame also covers some detail (a face, an edge)
   avoids it.
 - Keep the mouse on the page. If it is lifted and set down somewhere the keyframes
   don't cover, scanning continues from a best guess.

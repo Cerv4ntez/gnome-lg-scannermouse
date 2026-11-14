@@ -54,6 +54,11 @@ SINGLE_TO_PIXELS = (np.array([[-0.0110, 0.2686], [-0.2771, -0.0182]]),
 # The sensor record in a frame lags its image by about a third of a frame, so a
 # frame's motion is blended with the next frame's (frames are processed one late).
 SENSOR_LAG = 0.3
+# The two sensors sit on one rigid body, so they report similar motion. On dark, glossy
+# areas one of them can stall (report next to nothing) while still claiming a usable
+# surface; then only the other one is used.
+STALL_MIN_PX = 2.0            # px the other sensor must move ...
+STALL_SHARE = 0.3             # ... while the stalled one reports less than this share of it
 SENSOR_MAX_STEP = 200         # px per frame; more is a counter jump (as when scanning starts), not motion
 
 # -- feature matching ------------------------------------------------------------
@@ -443,6 +448,7 @@ class Stitcher:
             self.early_lift = False            # lifted soon after the start: restart when put down
             self.unsure = 0                    # consecutive frames that couldn't be placed
             self.track_rejected = 0            # feature steps dropped for contradicting the sensors
+            self.stalled = 0                   # frames with one sensor stalled (the other one used)
             self.speed = 0.0                   # recent motion, px per frame (smoothed, for display)
             self.tracked_run = 0               # consecutive frames tracked from the previous one
             self.lost = False                  # position unknown until the page is found again
@@ -493,6 +499,15 @@ class Stitcher:
         counts = (1 - SENSOR_LAG) * delta(prev, rec) + SENSOR_LAG * delta(rec, nxt)
         ok1 = min(prev.quality1, rec.quality1, nxt.quality1) >= QUALITY_MIN
         ok2 = min(prev.quality2, rec.quality2, nxt.quality2) >= QUALITY_MIN
+        if ok1 and ok2:
+            m1 = math.hypot(*(counts[:2] @ SINGLE_TO_PIXELS[0]))
+            m2 = math.hypot(*(counts[2:] @ SINGLE_TO_PIXELS[1]))
+            if m2 >= STALL_MIN_PX and m1 < STALL_SHARE * m2:
+                ok1 = False
+                self.stalled += 1
+            elif m1 >= STALL_MIN_PX and m2 < STALL_SHARE * m1:
+                ok2 = False
+                self.stalled += 1
         if ok1 and ok2:
             return counts @ COUNTS_TO_PIXELS, float(counts @ COUNTS_TO_RADIANS)
         if ok1:
