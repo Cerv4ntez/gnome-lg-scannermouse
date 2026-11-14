@@ -33,6 +33,10 @@ SPECK_INK = 200               # grey level below which a pixel belongs to a dot 
 SPECK_AREA = 40               # dots up to this area may be removed ...
 SPECK_DISTANCE = 12           # ... if they are farther than this from any letter (i-dots never are)
 TEXT_AREA = 60                # components at least this big count as letters
+EDGE_MIN_LENGTH = 0.08        # photo edges: line segments at least this share of the page's long side ...
+EDGE_SIDE_PX = 6              # ... with scanned page this far on both sides,
+EDGE_TOLERANCE = 1.5          # ... agreeing on a direction within this many degrees ...
+EDGE_MIN_TOTAL = 0.5          # ... adding up to at least this share of the long side
 CONTRAST_PIVOT = 170          # grey level the contrast setting keeps: darker gets darker, lighter lighter
 
 
@@ -72,6 +76,51 @@ def analyse(gray, covered):
     angle = float(fine[int(np.argmax(fine_scores))])
     is_text = max(fine_scores) / float(np.median(scores)) >= TEXT_PEAKINESS
     return angle, is_text
+
+
+def edge_angle(gray, covered):
+    """Angle in degrees to turn a photo so its long straight edges (the photo's border)
+    run exactly horizontal or vertical, whichever is nearer; None without such edges.
+
+    Line segments are found with OpenCV's line segment detector; the direction that most
+    of their length agrees on (folded onto the nearest axis) wins. Lines along the border
+    of the scanned area are left out: there the scan ends, not the photo.
+    """
+    scale = min(1.0, ANALYSE_SIZE / max(gray.shape))
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    inside = cv2.resize(covered.astype(np.uint8), (small.shape[1], small.shape[0]),
+                        interpolation=cv2.INTER_NEAREST) > 0
+    found = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(small)[0]
+    if found is None:
+        return None
+    x1, y1, x2, y2 = found.reshape(-1, 4).T
+    length = np.hypot(x2 - x1, y2 - y1)
+    h, w = small.shape
+    ok = length >= EDGE_MIN_LENGTH * max(h, w)
+    # scanned on both sides along most of the line: not the border of the scanned area
+    t = np.linspace(0.05, 0.95, 19)[:, None]
+    px, py = x1 + t * (x2 - x1), y1 + t * (y2 - y1)                  # (19, n) points along each line
+    nx, ny = -(y2 - y1) / np.maximum(length, 1e-6), (x2 - x1) / np.maximum(length, 1e-6)
+    both = np.ones(px.shape, bool)
+    for side in (-EDGE_SIDE_PX, EDGE_SIDE_PX):
+        sx = np.clip((px + side * nx).astype(int), 0, w - 1)
+        sy = np.clip((py + side * ny).astype(int), 0, h - 1)
+        both &= inside[sy, sx]
+    ok &= both.mean(axis=0) >= 0.8
+    if not ok.any():
+        return None
+    # deviation from the nearest axis, in degrees (-45..45)
+    dev = (np.degrees(np.arctan2(y2 - y1, x2 - x1)) + 45) % 90 - 45
+    dev, length = dev[ok], length[ok]
+    bins = np.arange(-45, 45.01, 0.5)
+    hist = np.histogram(dev, bins, weights=length)[0]
+    hist = np.convolve(np.r_[hist[-4:], hist, hist[:4]], np.ones(5), 'same')[4:-4]   # wraps at +-45
+    peak = bins[int(np.argmax(hist))] + 0.25
+    near = np.abs((dev - peak + 45) % 90 - 45) <= EDGE_TOLERANCE
+    if length[near].sum() < EDGE_MIN_TOTAL * max(h, w):
+        return None
+    # rotating by +a degrees (counter-clockwise) turns a line at image angle d (y down) to d - a
+    return float(np.average(peak + ((dev[near] - peak + 45) % 90 - 45), weights=length[near]))
 
 
 def rotate(gray, covered, angle):

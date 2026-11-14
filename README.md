@@ -40,8 +40,11 @@ Output is greyscale: the scanner lights the page with a green LED and the sensor
 records no usable blue, so colour cannot be recovered.
 
 **Scanning mode** (settings menu): **Text** straightens, cleans and recognises the
-page as described below. **Photo** leaves the page as scanned: no straightening,
-evening out or text recognition, and its own contrast setting (1.0× by default).
+page as described below. **Photo** skips evening out and text recognition and has its
+own contrast setting (1.0× by default); **Straighten** turns a photo so its long edges
+(the photo's border) run exactly horizontal or vertical. The edges are found with
+OpenCV's line segment detector; lines along the border of the scanned area don't count,
+and without clear edges the photo is left as it is.
 Only the processing differs, so the mode can be switched at any time, even after
 scanning.
 
@@ -136,6 +139,11 @@ The protocol below was recovered from the vendor driver DLLs.
     sensors report no surface, the scale change between frames is accumulated and
     steps are enlarged by it. A few frames that can't be matched continue the last
     motion instead of losing it.
+  - **Reference frame.** Between neighbouring frames, a few px apart, the measured
+    rotation carries a small bias (about −0.3° per frame on one scan, even with
+    hundreds of matches), which added up to a visible kink. The rotation is therefore
+    measured against a reference frame, renewed every 40 px; the shift still comes from
+    the neighbouring frame.
   - **Weak matches.** With few matching points (under 60), the rotation a frame-to-frame
     match reports is unreliable: errors of 1–3° per frame once added up to a 15° kink
     after a slip. Such a match keeps its shift, but the rotation comes from the sensors,

@@ -184,16 +184,14 @@ class Window(Adw.ApplicationWindow):
         for switch in (self.straighten_switch, self.clean_switch):
             switch.connect('notify::active', lambda *_: (self._settings_changed(), self._show_page()))
         grid.attach(Gtk.Separator(), 0, 7, 2, 1)
-        grid.attach(Gtk.Label(label='Straighten text pages', xalign=0, hexpand=True), 0, 8, 1, 1)
+        grid.attach(Gtk.Label(label='Straighten', xalign=0, hexpand=True), 0, 8, 1, 1)
         grid.attach(self.straighten_switch, 1, 8, 1, 1)
         grid.attach(Gtk.Label(label='Even out background', xalign=0, hexpand=True), 0, 9, 1, 1)
         grid.attach(self.clean_switch, 1, 9, 1, 1)
-        page_hint = Gtk.Label(label='For pages that are mostly text: turn the lines level and upright, '
-                                    'and remove blotches from the paper.',
-                              xalign=0, wrap=True, max_width_chars=36)
-        page_hint.add_css_class('dim-label')
-        page_hint.add_css_class('caption')
-        grid.attach(page_hint, 0, 10, 2, 1)
+        self.page_hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=36)
+        self.page_hint.add_css_class('dim-label')
+        self.page_hint.add_css_class('caption')
+        grid.attach(self.page_hint, 0, 10, 2, 1)
         self.contrast_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, CONTRAST_MAX, 0.1)
         self.contrast_scale.set_value(self.settings[self._contrast_key()])
         self.contrast_scale.set_digits(1)
@@ -208,7 +206,7 @@ class Window(Adw.ApplicationWindow):
         self.contrast_hint.add_css_class('dim-label')
         self.contrast_hint.add_css_class('caption')
         grid.attach(self.contrast_hint, 0, 14, 2, 1)
-        self.text_settings = [self.straighten_switch, self.clean_switch]
+        self.text_settings = [self.clean_switch]
         self.settings_button = Gtk.MenuButton(icon_name='emblem-system-symbolic', tooltip_text='Scanner Settings',
                                               popover=Gtk.Popover(child=grid))
         header.pack_end(self.settings_button)
@@ -498,6 +496,11 @@ class Window(Adw.ApplicationWindow):
         for widget in self.text_settings:
             widget.set_sensitive(not photo)
         self.views.get_page(self.text_page).set_visible(not photo)
+        self.page_hint.set_label(
+            'Straighten: turn the photo so its long edges run straight. '
+            'Even out background is for text pages.'
+            if photo else 'For pages that are mostly text: turn the lines level and upright, '
+                          'and remove blotches from the paper.')
         self.contrast_hint.set_label(
             'Steepens the mid-tones; black and white stay as they are. 1.0× leaves the photo as scanned.'
             if photo else 'Darkens pale text and lightens faint grey on the paper. 1.0× leaves the page as scanned.')
@@ -614,6 +617,10 @@ class Window(Adw.ApplicationWindow):
             # evening out takes a moment, so the live preview only gets it once the scan is done
             if is_text and self.settings['clean_background'] and self.state != 'scanning':
                 img = cleanup.flatten_background(img, covered, scale)
+        elif self.settings['mode'] == 'photo' and self.settings['straighten']:
+            angle, found = self._analyse(img, covered)
+            if found:
+                img, covered = cleanup.rotate(img, covered, angle)
         if self.crop_button.get_active() if crop is None else crop:
             top, bottom, left, right = cleanup.crop_box(covered)
             img = img[top:bottom, left:right]
@@ -621,12 +628,17 @@ class Window(Adw.ApplicationWindow):
         return np.ascontiguousarray(np.rot90(img, turns))
 
     def _analyse(self, img, covered):
-        """Text detection and skew angle, re-measured at most every ANALYSE_EVERY s
-        while scanning and once for the finished page."""
+        """(angle to straighten the page, whether to): text detection and skew angle, or
+        for photos the direction of their long edges. Re-measured at most every
+        ANALYSE_EVERY s while scanning and once for the finished page."""
         now = time.monotonic()
         if self.analysis is None or (self.state == 'scanning' and now - self.analysis[2] > ANALYSE_EVERY):
-            angle, is_text = cleanup.analyse(img, covered)
-            self.analysis = (angle, is_text, now)
+            if self.settings['mode'] == 'photo':
+                angle = cleanup.edge_angle(img, covered)
+                self.analysis = (angle or 0.0, angle is not None, now)
+            else:
+                angle, is_text = cleanup.analyse(img, covered)
+                self.analysis = (angle, is_text, now)
         return self.analysis[:2]
 
     def _find_orientation(self):

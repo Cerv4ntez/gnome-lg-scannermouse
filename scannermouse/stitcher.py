@@ -66,6 +66,10 @@ ORB_FEATURES = 1500
 RATIO = 0.8                   # Lowe's ratio test for descriptor matches
 RANSAC_PX = 3.0               # reprojection tolerance
 TRACK_MIN_INLIERS = 20        # frame-to-frame match accepted
+# Frame-to-frame steps of a few px carry a small rotation bias (about -0.3 degrees per frame
+# on a test scan, even with hundreds of matches), which adds up to a visible kink. Frames
+# are measured against a reference frame instead, renewed only every KEY_SPACING px.
+KEY_SPACING = 40              # px
 ROTATION_MIN_INLIERS = 60     # below this, a match's rotation is unreliable (errors of 1-3 degrees
                               # per frame added up to a 15 degree kink); the sensors' is used instead
 SNAP_MIN_INLIERS = 40         # match to an older keyframe accepted (stricter: a wrong one does damage)
@@ -483,6 +487,7 @@ class Stitcher:
             self.magnification = 1.0           # page px per px of the last frame (above 1 while lifted)
             self.velocity = None               # last step, carried on over frames that can't be matched
             self.prev_small = None             # previous frame, reduced, to tell when the mouse stands still
+            self.key = None                    # (pose, Features) of the reference frame for tracking
 
     def start(self):
         """Start the background re-registration and re-composition."""
@@ -679,6 +684,13 @@ class Stitcher:
                 sensor_step = np.array([-sensor[0][0], -sensor[0][1], sensor[1]])
             if self.prev is not None:
                 step, self.last_track = feats.relative_to(self.prev[1], TRACK_MIN_INLIERS)
+                if step is not None and self.key is not None and self.key[1] is not self.prev[1]:
+                    # the rotation, measured against the reference frame: fewer steps add
+                    # up, and over the larger distance static content stands out
+                    rel, n = feats.relative_to(self.key[1], TRACK_MIN_INLIERS)
+                    if rel is not None and n >= ROTATION_MIN_INLIERS:
+                        step = np.array([step[0], step[1],
+                                         relative(self.prev[0], compose(self.key[0], rel))[2]])
                 if step is not None and sensor_step is not None:
                     # On text with repeated words, a fast-moving frame can match the
                     # wrong copy of a word and jump by a line or more. The sensors
@@ -767,10 +779,15 @@ class Stitcher:
                 self.unsure += 1
                 self.link = None
                 if self.unsure > LOST_AFTER and self.frames_used:
-                    self.lost = True
+                    self.lost, self.key = True, None
                 return False
             self.unsure = 0
             self.pose = np.array(pose, float)
+            # a new reference frame once this one is far enough from it, or when this
+            # frame wasn't placed by tracking against it
+            if (self.key is None or source != 'features'
+                    or math.hypot(*(self.pose[:2] - self.key[0][:2])) >= KEY_SPACING):
+                self.key = (self.pose.copy(), feats)
 
             # how trustworthy and sharp this frame is, for the best-frame page
             if source == 'start':
