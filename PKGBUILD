@@ -29,7 +29,7 @@ check() {
 
 package() {
   cd "$pkgname"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  python -m installer --destdir="$pkgdir" dist/*-$pkgver-*.whl
   install -d "$pkgdir/usr/share/icons"
   install -Dm644 data/io.github.scannermouse.ScannerMouse.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 data/io.github.scannermouse.ScannerMouse.metainfo.xml -t "$pkgdir/usr/share/metainfo"
