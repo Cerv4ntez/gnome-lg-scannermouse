@@ -25,6 +25,7 @@ SKEW_RANGE = 90               # degrees searched either way (covers sideways tex
 TEXT_PEAKINESS = 1.6          # line-profile contrast at the best angle vs a typical angle for "text"
 ANALYSE_SIZE = 900            # px; the page is analysed at this size
 PROFILE_BAND = 3              # px at that size; text lines there are ~10-15 px apart
+SOLID = 5                     # px at that size; dark areas at least this wide and high are not text
 BACKGROUND_KERNEL = 25        # px at full resolution; wider than text strokes, narrower than blotches
 WHITE = 0.9                   # after flattening, this share of the paper level becomes pure white
 OSD_MIN_CONFIDENCE = 2.0      # Tesseract orientation confidence needed to turn the page
@@ -49,7 +50,12 @@ def analyse(gray, covered):
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     mask = cv2.resize(covered.astype(np.uint8), (small.shape[1], small.shape[0]),
                       interpolation=cv2.INTER_NEAREST) > 0
-    ys, xs = np.nonzero((small < INK * 255) & mask)
+    ink = ((small < INK * 255) & mask).astype(np.uint8)
+    # solid dark areas (the table beside the page, a picture, a QR code) have straight
+    # edges of their own, in any direction: only thin strokes count
+    solid = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((SOLID, SOLID), np.uint8))
+    ink[cv2.dilate(solid, np.ones((SOLID, SOLID), np.uint8)) > 0] = 0
+    ys, xs = np.nonzero(ink)
     if len(xs) < 200:
         return 0.0, False
     if len(xs) > 40000:                         # plenty for a profile

@@ -68,6 +68,18 @@ def test_text_is_recognised_as_text_and_levelled():
     assert not cleanup.analyse(cv2.GaussianBlur(noise, (0, 0), 8), covered)[1]
 
 
+def test_dark_areas_beside_the_text_do_not_set_the_direction():
+    page = np.full((900, 700), 255, np.uint8)
+    for y in range(300, 500, 40):               # a few short lines, as on a label
+        cv2.putText(page, 'quick brown fox', (200, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 0, 2, cv2.LINE_AA)
+    page[:, :90] = 60                           # the table beside the paper
+    page[:, 640:] = 60
+    page[600:760, 250:410] = 0                  # a solid picture
+    tilted, mask = cleanup.rotate(page, np.ones(page.shape, bool), 5.0)
+    angle, is_text = cleanup.analyse(tilted, mask)
+    assert is_text and abs(angle + 5.0) < 0.5
+
+
 def test_photo_edges_are_found():
     """A dark photo on a light ground, turned by 4 degrees: the angle to turn it back."""
     scene = np.full((800, 1100), 235, np.uint8)

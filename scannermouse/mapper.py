@@ -62,6 +62,12 @@ OVERLAP_MIN_CORRELATION = 0.15  # correlation over the whole overlap for a link 
 PLAUSIBLE_PX = 200            # an overlap may move a segment at most this far from its current
                               # estimate: on text with repeated words, most feature matches link
                               # different places that share words, typically 400-1000 px off
+FAR_AGREE = 3                 # ... unless this many segments, at most FAR_SPAN apart, are all moved
+FAR_SPAN = 8                  # the same way (within FAR_PX): then the tracker has drifted that far.
+FAR_PX = 30                   # Shared words move each segment somewhere else.
+FAR_MIN_CORRELATION = 0.45    # ... and their overlap is clearly the same picture: similar photos
+                              # (a strip of portraits) reach 0.3, the same place seen again
+                              # is typically 0.4-0.8
 SOLVE_EVERY = 1.5             # s between position solves
 COMPOSE_EVERY = 3.0           # s at least between page rebuilds (they compete with live tracking)
 BUSY_SHARE = 2.0              # a solve or rebuild that took t s is not started again within this many t,
@@ -92,9 +98,9 @@ def _weight(inliers):
     return float(np.clip(inliers / 100.0, 0.4, 3.0))
 
 
-def overlap_agrees(img, ref, rel):
+def overlap_agrees(img, ref, rel, least=OVERLAP_MIN_CORRELATION):
     """Whether frame `img`, placed at `rel` relative to frame `ref`, matches it over
-    their whole overlap.
+    their whole overlap (with a correlation of at least `least`).
 
     Feature matches alone can link two different places that happen to show the
     same words (a document repeating an address, say). There only the repeated
@@ -118,7 +124,7 @@ def overlap_agrees(img, ref, rel):
     energy = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
     if energy < 1e-6:
         return True                             # blank paper: nothing contradicts
-    return float((a * b).sum()) / energy >= OVERLAP_MIN_CORRELATION
+    return float((a * b).sum()) / energy >= least
 
 
 class Segment:
@@ -148,6 +154,7 @@ class Mapper:
         self.edges = []                         # (i, j, pose of j relative to i, weight)
         self.tested = set()
         self.unconfirmed = []                   # XFeat overlaps waiting for a confirming neighbour
+        self.far = []                           # implausible overlaps waiting for agreeing neighbours
         self.fit = []                           # per segment: True / False (misplaced) / None (unknown)
         self.pending = collections.deque()      # segments not yet searched for overlaps
         self.recheck = 0                        # round-robin position for re-checking old segments
@@ -295,20 +302,42 @@ class Mapper:
                 rel, inliers = seg.feats.relative_to(self.segments[j].feats, MATCH_INLIERS)
             if rel is None:
                 continue
+            far = False
             if self.linked[i]:
                 with self.lock:
                     expected = align.relative(self.poses[j], self.poses[i])
-                if math.hypot(rel[0] - expected[0], rel[1] - expected[1]) > PLAUSIBLE_PX:
-                    self.stats['implausible'] += 1
-                    continue
-            if not overlap_agrees(seg.img, self.segments[j].img, rel):
+                far = math.hypot(rel[0] - expected[0], rel[1] - expected[1]) > PLAUSIBLE_PX
+            if not overlap_agrees(seg.img, self.segments[j].img, rel,
+                                  FAR_MIN_CORRELATION if far else OVERLAP_MIN_CORRELATION):
                 self.stats['repeats rejected'] += 1
                 continue
             edge = (j, i, rel, _weight(inliers))
-            for e in (self._confirmed(edge) if by_xfeat else [edge]):
+            if far:
+                found = self._agreed(edge)
+                self.stats['implausible'] += not found
+            else:
+                found = self._confirmed(edge) if by_xfeat else [edge]
+            for e in found:
                 with self.lock:
                     self.edges.append(e)
                 self.stats['overlaps'] += 1
+
+    def _agreed(self, edge):
+        """The far overlaps that can be used now: this one and the waiting ones around it,
+        if enough segments are moved the same way; else none (it waits)."""
+        self.far.append(edge)
+        with self.lock:
+            def shift(e):
+                return _compose(self.poses[e[0]], e[2])[:2] - self.poses[e[1]][:2]
+            mine = shift(edge)
+            group = [n for n, e in enumerate(self.far) if abs(e[1] - edge[1]) <= FAR_SPAN
+                     and math.hypot(*(shift(e) - mine)) <= FAR_PX]
+        if len({self.far[n][1] for n in group}) < FAR_AGREE:
+            return []
+        found = [self.far[n] for n in group]
+        self.far = [e for n, e in enumerate(self.far) if n not in group]
+        self.stats['far overlaps'] += len(found)
+        return found
 
     def _confirmed(self, edge):
         """The XFeat overlaps that can be used now: this one and a waiting neighbour if
