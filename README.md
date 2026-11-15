@@ -32,7 +32,12 @@ Your user must be able to open the scanner's `/dev/videoN` node (the `video` gro
    fast, red means slow down.
 3. Press the **Scan** button on the mouse (or Esc) to finish.
 4. Turn the page upright with the rotate buttons. **Crop**, on by default, trims the
-   ragged edges. Then save as PNG or PDF.
+   ragged edges. Then save as PNG, JPEG or PDF (chosen by the file name's ending; all
+   carry the scan resolution of 320 dpi).
+
+If the mouse is unplugged during a scan, the scan ends and the page so far is kept.
+The status line under the page also says when frames were dropped because the computer
+was busy; a few don't matter, many mean the page may have gaps or steps.
 
 Hold Ctrl and turn the mouse wheel to zoom into the page; the wheel alone then scrolls.
 
@@ -85,8 +90,9 @@ can be edited and copied (**Copy All**), or saved as a `.txt` file.
 - **Cleanup:** specks read as letters and pure scribbles are dropped.
 - **PDF:** when text has been recognised, a saved PDF gets an invisible text layer,
   so it is searchable and copyable in any PDF viewer.
-- **Languages:** German and English are used when installed (`tesseract-data-deu`
-  for German).
+- **Languages:** the language button in the Text tab lists the installed Tesseract
+  languages (`tesseract-data-…` packages) and lets you choose which to recognise.
+  Without a choice, the system's language, German and English are used.
 - **Re-reading:** turning the page with the rotate buttons reads it again.
 
 **Contrast** (settings menu, 1.5× by default for text, 1.0× for photos) steepens the grey levels around a light
@@ -208,8 +214,9 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 
 ## Limitations
 
-- The sensor fallback's constants were calibrated from one 40 s test scan. They are
-  not read from the calibration data stored in the mouse's EEPROM.
+- The constants for the motion sensors and the LED's brightness profile were measured
+  on one mouse. They are not read from the calibration data stored in the mouse's
+  EEPROM; another unit can be calibrated from its own scans (see Development).
 - Over large dark areas of glossy photos, the camera finds nothing to track (only the
   LED's reflections, which stay in place), and the sensors can under-count the motion,
   so such a stretch can come out compressed. Sweeping so that each frame also covers some detail (a face, an edge)
@@ -217,9 +224,37 @@ Selector 3 of the same unit reads and writes the firmware flash. The app never u
 - Keep the mouse on the page. If it is lifted and set down somewhere the keyframes
   don't cover, scanning continues from a best guess.
 - The raw frames of the last 3 scans are kept in `~/.cache/scannermouse/`, so a problem
-  scan can be replayed and diagnosed.
+  scan can be replayed and diagnosed. They show whatever was scanned; delete them if
+  that matters.
 - Set `SCANNERMOUSE_DEBUG=/some/dir` to record the raw frames and a per-frame log of
   each scan, for diagnosing stitching problems.
+
+## Development
+
+**Tests.** `python -m pytest` runs the test suite (about a minute). It needs no scanner
+and no recordings: [`tests/synthetic.py`](tests/synthetic.py) makes up a page of random
+text and the frames and sensor readings of a mouse swept over it, and the tests check
+that the stitched page matches that page to within 2 px.
+
+**Replaying a scan.** [`tools/replay.py`](tools/replay.py) stitches recordings from
+`~/.cache/scannermouse/` without the scanner or the app:
+
+```sh
+tools/replay.py ~/.cache/scannermouse/scan-*.mjpg --out /tmp/pages
+```
+
+It prints one line of figures per recording (segments, overlaps, how far the tracker
+drifted, how well the overlaps fit) and saves the pages. By default the Mapper runs in
+step with the frames instead of in its background process, so a recording gives the
+same page every time and two versions of the code can be compared; `--background` runs
+it as the app does, `--live` shows the live tracker alone.
+
+**Calibrating another mouse.** [`tools/calibrate.py`](tools/calibrate.py) fits the
+motion sensors' constants and the LED profile from recordings, compares them with the
+values in use, and with `--write` stores them in
+`~/.config/scannermouse/calibration.json`, which the app reads at start-up. Scan a
+detailed matte page (a newspaper) for 30 s or more in overlapping sweeps for this.
+Delete the file to return to the built-in values.
 
 ## License
 

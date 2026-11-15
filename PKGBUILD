@@ -1,6 +1,6 @@
 # Maintainer: Cerv4ntez <18594385+Cerv4ntez@users.noreply.github.com>
 pkgname=gnome-lg-scannermouse
-pkgver=0.1.13
+pkgver=0.1.14
 pkgrel=1
 pkgdesc='GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)'
 arch=('any')
@@ -9,6 +9,7 @@ license=('GPL-3.0-or-later' 'Apache-2.0')  # Apache-2.0: the bundled XFeat model
 depends=('python' 'python-gobject' 'python-cairo' 'python-numpy' 'python-scipy' 'python-opencv'
          'gtk4' 'libadwaita' 'gstreamer' 'gst-plugins-base' 'gst-plugins-good')
 makedepends=('git' 'python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+checkdepends=('python-pytest')
 optdepends=('tesseract: text recognition and upright detection'
             'tesseract-data-osd: turn sideways or upside-down pages upright'
             'tesseract-data-eng: English text recognition'
@@ -21,11 +22,17 @@ build() {
   python -m build --wheel --no-isolation
 }
 
+check() {
+  cd "$pkgname"
+  python -m pytest -q
+}
+
 package() {
   cd "$pkgname"
   python -m installer --destdir="$pkgdir" dist/*.whl
   install -d "$pkgdir/usr/share/icons"
   install -Dm644 data/io.github.scannermouse.ScannerMouse.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 data/io.github.scannermouse.ScannerMouse.metainfo.xml -t "$pkgdir/usr/share/metainfo"
   cp -r data/icons/hicolor "$pkgdir/usr/share/icons/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
 }

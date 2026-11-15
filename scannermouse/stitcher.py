@@ -30,7 +30,10 @@ import threading
 import cv2
 import numpy as np
 
-from .mapper import MapperProcess, overlap_agrees
+from . import calibration
+from .mapper import InlineMapper, MapperProcess, overlap_agrees
+
+_calibrated = calibration.load()               # this mouse's own values, where it has been calibrated
 
 CROP_TOP = 56                 # rows hidden or shadowed by the housing
 DPI = 320                     # nominal sensor resolution (LG spec sheet)
@@ -42,15 +45,17 @@ QUALITY_MIN = 30              # sensor surface quality below this = not tracking
 # the mouse, so both are used jointly as a rigid body: inputs are
 # [dx1, dy1, dx2, dy2] sensor counts for the frame interval.
 # content shift inside the frame (px) = counts @ COUNTS_TO_PIXELS
-COUNTS_TO_PIXELS = np.array([[-0.0476, 0.1556],
-                             [-0.0637, 0.0677],
-                             [0.0470, 0.1602],
-                             [-0.2024, -0.0662]])
+COUNTS_TO_PIXELS = _calibrated.get('counts_to_pixels', np.array([[-0.0476, 0.1556],
+                                                                 [-0.0637, 0.0677],
+                                                                 [0.0470, 0.1602],
+                                                                 [-0.2024, -0.0662]]))
 # change of frame rotation (rad) = counts @ COUNTS_TO_RADIANS
-COUNTS_TO_RADIANS = -np.radians(np.array([0.01103, 0.00698, -0.01022, -0.00588]))
+COUNTS_TO_RADIANS = _calibrated.get('counts_to_radians',
+                                    -np.radians(np.array([0.01103, 0.00698, -0.01022, -0.00588])))
 # with only one sensor tracking: content shift (px) = that sensor's counts @ SINGLE_TO_PIXELS[n]
-SINGLE_TO_PIXELS = (np.array([[-0.0110, 0.2686], [-0.2771, -0.0182]]),
-                    np.array([[-0.0045, 0.3268], [-0.2653, 0.0107]]))
+SINGLE_TO_PIXELS = _calibrated.get('single_to_pixels',
+                                   np.array([[[-0.0110, 0.2686], [-0.2771, -0.0182]],
+                                             [[-0.0045, 0.3268], [-0.2653, 0.0107]]]))
 # The sensor record in a frame lags its image by about a third of a frame, so a
 # frame's motion is blended with the next frame's (frames are processed one late).
 SENSOR_LAG = 0.3
@@ -82,6 +87,7 @@ MAGNIFICATION_MAX = 2.5       # limit of the scale change tracked while the mous
 EARLY_LIFT_WITHIN = 60        # frames (2 s): a lift this soon after the start ...
 EARLY_LIFT_FRAMES = 5         # ... of at least this many frames with both sensors off restarts the scan
 LOST_AFTER = 4                # unplaceable frames in a row before the position counts as lost
+DROP_COUNT_AFTER = 3          # frames; the camera itself skips a frame number right after starting
 RELOCATE_EVERY = 3            # while lost, search all keyframes on every n-th frame
 RESUME_AFTER = 8              # tracked frames before painting resumes on new ground after a lift
 SEGMENT_SPACING = 8           # px a frame must move to be kept as a segment
@@ -124,11 +130,11 @@ WHITE_PERCENTILE = 99.5       # ... measured as this percentile of the scanned p
 # different places in the frame, must come out equally bright (residual about 3%).
 # A fixed profile keeps the page's own brightness: estimating the light from the
 # image itself turns the dark parts of a photo grey.
-ILLUMINATION = {                      # (power of u, power of v): coefficient
+ILLUMINATION = _calibrated.get('illumination', {      # (power of u, power of v): coefficient
     (0, 0): 0.5848, (0, 1): -0.2011, (0, 2): 0.2712, (0, 3): 0.1370, (0, 4): -0.0899,
     (1, 0): -0.0078, (1, 1): -0.0182, (1, 2): -0.0172, (1, 3): 0.0483, (1, 4): 0.0393,
     (2, 0): 0.1051, (2, 1): 0.1106, (2, 2): -0.1675, (2, 3): -0.0918, (2, 4): -0.0020,
-}
+})
 
 
 # On glossy photos the LEDs are reflected into the camera as four bright spots at fixed
@@ -136,7 +142,7 @@ ILLUMINATION = {                      # (power of u, power of v): coefficient
 # areas (hair) into rows of rungs; and matched as features they stand still while the page
 # moves. They are left out of both. (x, y) in the cropped frame, from the dark frames of
 # three photo scans.
-GLARE_SPOTS = ((132, 5), (226, 4), (402, 4), (497, 4))
+GLARE_SPOTS = _calibrated.get('glare_spots', ((132, 5), (226, 4), (402, 4), (497, 4)))
 GLARE_RADIUS = 24             # px, a little more than the spots' extent
 
 
@@ -194,16 +200,20 @@ def sharpness(img):
     return cv2.resize(local, (w // SHARP_REDUCE, h // SHARP_REDUCE), interpolation=cv2.INTER_AREA), float(grad.mean())
 
 
+@functools.cache
+def _matcher():
+    # made on first use in each process: Features arrive in the Mapper's process ready-made
+    return cv2.BFMatcher(cv2.NORM_HAMMING)
+
+
 class Features:
     """ORB keypoints of one frame."""
 
     _orb = None
-    _matcher = None
 
     def __init__(self, gray):
         if Features._orb is None:
             Features._orb = cv2.ORB_create(ORB_FEATURES, fastThreshold=8)
-            Features._matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         keep = (glare_mask(*gray.shape) > 0.5).astype(np.uint8)
         kps, self.desc = Features._orb.detectAndCompute(gray, keep)
         self.last_scale = 1.0
@@ -214,7 +224,7 @@ class Features:
         """This frame's pose relative to `ref`, or None. Also returns the inlier count."""
         if self.desc is None or ref.desc is None or len(self.pts) < min_inliers or len(ref.pts) < min_inliers:
             return None, 0
-        pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(self.desc, ref.desc, k=2)
+        pairs = _matcher().knnMatch(self.desc, ref.desc, k=2)
         good = [p[0] for p in pairs if len(p) == 2 and p[0].distance < RATIO * p[1].distance]
         if len(good) < min_inliers:
             return None, len(good)
@@ -327,30 +337,16 @@ class Canvas:
         positions loses about a quarter of the fine detail, but cubic takes longer,
         so the live preview uses linear and the rebuilt pages cubic."""
         h, w = img.shape
-        corners = np.array([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]], float)
-        cx, cy = self._to_canvas(corners[:, 0], corners[:, 1], pose, h, w)
-        self._ensure(cx.min(), cy.min(), cx.max(), cy.max())
-        cx, cy = self._to_canvas(corners[:, 0], corners[:, 1], pose, h, w)
-        x0, y0 = int(math.floor(cx.min())), int(math.floor(cy.min()))
-        x1, y1 = int(math.ceil(cx.max())) + 1, int(math.ceil(cy.max())) + 1
-        # frame -> this canvas region, as one affine warp of all layers at once
-        c, s = math.cos(pose[2]), math.sin(pose[2])
-        tx = pose[0] + self.origin[0] - x0 - (c * (w - 1) / 2 - s * (h - 1) / 2)
-        ty = pose[1] + self.origin[1] - y0 - (s * (w - 1) / 2 + c * (h - 1) / 2)
-        M = np.float32([[c, -s, tx], [s, c, ty]])
+        (x0, y0, x1, y1), _ = self._warp(pose, h, w)
+        self._ensure(x0, y0, x1 - 1, y1 - 1)
+        (x0, y0, x1, y1), M = self._warp(pose, h, w)     # growing moves the canvas origin
         wmask = _edge_weight(h, w)
-        warp = lambda layers, flags: cv2.warpAffine(np.dstack(layers).astype(np.float32), M, (x1 - x0, y1 - y0),
-                                                    flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # weights always linear: cubic overshoots below 0
-        image = warp([img * wmask, img], cv2.INTER_CUBIC if fine else cv2.INTER_LINEAR)
-        weights = warp([wmask] + ([cv2.resize(sharp, (w, h), interpolation=cv2.INTER_LINEAR)] if sharp is not None else []),
-                       cv2.INTER_LINEAR)
-        if weights.ndim == 2:
-            weights = weights[..., None]
-        warped = np.dstack([image[..., 0], weights[..., 0], image[..., 1]] + ([weights[..., 1]] if sharp is not None else []))
-        ws = warped[..., 1]
+        warp = lambda layer, flags: cv2.warpAffine(layer, M, (x1 - x0, y1 - y0), flags=flags,
+                                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        image_flags = cv2.INTER_CUBIC if fine else cv2.INTER_LINEAR
+        ws = warp(wmask, cv2.INTER_LINEAR)      # weights always linear: cubic overshoots below 0
         if blend:
-            self.sum[y0:y1, x0:x1] += warped[..., 0] * weight
+            self.sum[y0:y1, x0:x1] += warp(img * wmask, image_flags) * weight
             self.weight[y0:y1, x0:x1] += ws * weight
             b = self.bbox or (x0, y0, x1, y1)
             self.bbox = (min(b[0], x0), min(b[1], y0), max(b[2], x1), max(b[3], y1))
@@ -359,14 +355,13 @@ class Canvas:
         # best-frame page: take over where this frame scores clearly higher,
         # gradually over REPLACE_RANGE so there are no hard seams
         inside = ws > BEST_EDGE                 # the outermost pixels of a frame never win
-        new = ws * warped[..., 3] * confidence
+        new = ws * warp(cv2.resize(sharp, (w, h), interpolation=cv2.INTER_LINEAR), cv2.INTER_LINEAR) * confidence
         old = self.score[y0:y1, x0:x1]
         ratio = new / np.maximum(old, 1e-9)
         share = np.where(old > 0, (ratio - REPLACE_MARGIN) / REPLACE_RANGE, 1.0)
         share = np.clip(share, 0.0, 1.0) * inside
         best = self.best[y0:y1, x0:x1]
-        value = warped[..., 2]
-        best += share * (value - best)
+        best += share * (warp(img, image_flags) - best)
         old += share * (new - old)
 
     def _ensure(self, x0, y0, x1, y1):
@@ -391,22 +386,30 @@ class Canvas:
             b = self.bbox
             self.bbox = (b[0] + left, b[1] + top, b[2] + left, b[3] + top)
 
-    def page(self, max_size=None, best=False):
-        """(page as 8-bit greyscale, mask of scanned pixels, size relative to full resolution), unmirrored, or None."""
+    def snapshot(self, max_size=None, best=False):
+        """Copies of what `develop` needs for a page of at most `max_size`, or None. Quick,
+        so the tracker (which paints into the canvas) only waits for this part."""
         if self.bbox is None:
             return None
         x0, y0, x1, y1 = self.bbox
         step = 1
         if max_size:
             step = max(1, int(math.ceil(max(y1 - y0, x1 - x0) / max_size)))
-        s = self.sum[y0:y1:step, x0:x1:step]
-        wt = self.weight[y0:y1:step, x0:x1:step]
+        part = (slice(y0, y1, step), slice(x0, x1, step))
+        return (self.sum[part].copy(), self.weight[part].copy(),
+                self.score[part].copy() if best else None, self.best[part].copy() if best else None, step)
+
+    @staticmethod
+    def develop(snapshot):
+        """(page as 8-bit greyscale, mask of scanned pixels, size relative to full resolution), unmirrored, or None."""
+        if snapshot is None:
+            return None
+        s, wt, score, best, step = snapshot
         covered = wt > 0.05
         img = np.where(covered, s / np.maximum(wt, 1e-6), 1.0)
-        if best:
+        if best is not None:
             # where no segment qualified for the best page, show the averaged one
-            chosen = self.score[y0:y1:step, x0:x1:step] > 0
-            img = np.where(chosen, self.best[y0:y1:step, x0:x1:step], img)
+            img = np.where(score > 0, best, img)
         if not covered.any():
             return None
         # the sensor sees the page mirrored; the brightest part of the page (paper,
@@ -415,6 +418,10 @@ class Canvas:
         img = img[:, ::-1] / max(white, 1e-3)
         img = np.ascontiguousarray((img * 255).clip(0, 255).astype(np.uint8))
         return img, np.ascontiguousarray(covered[:, ::-1]), 1.0 / step
+
+    def page(self, max_size=None, best=False):
+        """As `develop`, of this canvas."""
+        return self.develop(self.snapshot(max_size, best))
 
 
 def render_segments(segments, poses, fit, stats=None):
@@ -426,15 +433,17 @@ def render_segments(segments, poses, fit, stats=None):
     segments lying over text.
     """
     canvas = Canvas()
-    imgs = [seg.img.astype(np.float32) / 255 for seg in segments]
-    for seg, img, pose, ok in zip(segments, imgs, poses, fit):
+    # converted one at a time: all at once, a long scan needs a gigabyte for a moment
+    image = lambda seg: seg.img.astype(np.float32) / 255
+    for seg, pose, ok in zip(segments, poses, fit):
         # blurred / tilted / lifted / not fitting segments only fill otherwise empty spots
         usable = seg.sharpness is not None and ok is not False
-        canvas.paint(img, pose, weight=1.0 if usable else REJECTED_WEIGHT, fine=True)
+        canvas.paint(image(seg), pose, weight=1.0 if usable else REJECTED_WEIGHT, fine=True)
     disagreeing = 0
-    for seg, img, pose, ok in zip(segments, imgs, poses, fit):
+    for seg, pose, ok in zip(segments, poses, fit):
         if seg.sharpness is None or ok is False:
             continue                            # blurred / tilted / lifted, or not fitting
+        img = image(seg)
         pose = canvas.refine(img, pose)
         agreement = canvas.consensus(img, pose)
         if agreement is not None and agreement < CONSENSUS_MIN:
@@ -447,16 +456,20 @@ def render_segments(segments, poses, fit, stats=None):
 
 
 class Stitcher:
-    def __init__(self):
+    def __init__(self, inline=False):
+        """`inline`: run the Mapper in step with the frames instead of in a background
+        process, which makes a replayed recording give the same page every time."""
         self.lock = threading.Lock()
+        self.inline = inline
         self.mapper = None
         self.started = False
         self.restarts = 0                      # scans restarted after an early lift
         self.reset()
 
     def reset(self):
-        if self.mapper is None:
-            self.mapper = MapperProcess(self._adopt)
+        if self.mapper is None or not self.mapper.alive():
+            # also after the background process crashed
+            self.mapper = InlineMapper(self._adopt) if self.inline else MapperProcess(self._adopt)
         with self.lock:
             self.mapper.reset()
             self.canvas = Canvas()
@@ -477,6 +490,8 @@ class Stitcher:
             self.unsure = 0                    # consecutive frames that couldn't be placed
             self.track_rejected = 0            # feature steps dropped for contradicting the sensors
             self.stalled = 0                   # frames with one sensor stalled (the other one used)
+            self.dropped = 0                   # frames the camera sent that never arrived here
+            self.counter = None                # frame counter of the last record
             self.speed = 0.0                   # recent motion, px per frame (smoothed, for display)
             self.tracked_run = 0               # consecutive frames tracked from the previous one
             self.lost = False                  # position unknown until the page is found again
@@ -622,6 +637,10 @@ class Stitcher:
                 self.pose = fix(self.pose)
                 if self.prev is not None:
                     self.prev = (fix(self.prev[0]), self.prev[1])
+                if self.key is not None:
+                    # the reference frame too: left where it was, the next frame's rotation
+                    # would undo the correction and pass the wrong turn on to the Mapper
+                    self.key = (fix(self.key[0]), self.key[1])
                 self.anchor = (k, now)
 
     def _paint_segment(self, canvas, k, pose):
@@ -641,6 +660,13 @@ class Stitcher:
         """
         if rec is None:
             return False
+        # The mouse numbers its frames (one byte). A gap means frames were dropped on the way
+        # because processing fell behind; the next step then spans the gap, in the image and
+        # in the sensor counts alike, so it is only counted. (The first frames of a stream
+        # always skip one.)
+        if self.counter is not None and self.frame_no >= DROP_COUNT_AFTER:
+            self.dropped += (rec.counter - self.counter - 1) % 256
+        self.counter = rec.counter
         # Lifted right after the start (to reposition the mouse, say): what was scanned
         # before can't be placed reliably relative to where it is put down, so start
         # afresh there. A lift shows in both sensors losing the surface and the image
@@ -661,7 +687,9 @@ class Stitcher:
         pending, self.pending = self.pending, (rec, rgb)
         if pending is None:
             return False
-        return self._place(pending[0], pending[1], rec)
+        placed = self._place(pending[0], pending[1], rec)
+        self.mapper.step()
+        return placed
 
     def flush(self):
         """Place the frame still held back, at the end of a scan."""
@@ -684,6 +712,7 @@ class Stitcher:
                 sensor_step = np.array([-sensor[0][0], -sensor[0][1], sensor[1]])
             if self.prev is not None:
                 step, self.last_track = feats.relative_to(self.prev[1], TRACK_MIN_INLIERS)
+                reliable = step is not None and self.last_track >= ROTATION_MIN_INLIERS
                 if step is not None and self.key is not None and self.key[1] is not self.prev[1]:
                     # the rotation, measured against the reference frame: fewer steps add
                     # up, and over the larger distance static content stands out
@@ -691,6 +720,7 @@ class Stitcher:
                     if rel is not None and n >= ROTATION_MIN_INLIERS:
                         step = np.array([step[0], step[1],
                                          relative(self.prev[0], compose(self.key[0], rel))[2]])
+                        reliable = True
                 if step is not None and sensor_step is not None:
                     # On text with repeated words, a fast-moving frame can match the
                     # wrong copy of a word and jump by a line or more. The sensors
@@ -700,9 +730,9 @@ class Stitcher:
                     if math.hypot(*(step[:2] - sensor_step[:2])) > limit:
                         step = None
                         self.track_rejected += 1
-                if step is not None and self.last_track < ROTATION_MIN_INLIERS:
-                    # weak match: keep its shift, take the rotation from the sensors (none
-                    # if only one of them tracks)
+                if step is not None and not reliable:
+                    # weak match, and none to the reference frame either: keep its shift,
+                    # take the rotation from the sensors (none if only one of them tracks)
                     step = np.array([step[0], step[1], sensor[1] if sensor is not None else 0.0])
                 if step is not None:
                     source, track_scale = 'features', feats.last_scale
@@ -837,4 +867,5 @@ class Stitcher:
     def page(self, max_size=None, best=False):
         """(page as 8-bit greyscale, mask of scanned pixels, size relative to full resolution), unmirrored, or None."""
         with self.lock:
-            return self.canvas.page(max_size, best)
+            snapshot = self.canvas.snapshot(max_size, best)
+        return Canvas.develop(snapshot)

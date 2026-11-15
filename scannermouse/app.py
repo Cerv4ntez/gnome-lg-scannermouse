@@ -3,9 +3,11 @@
 import collections
 import json
 import os
+import signal
 import sys
 import threading
 import time
+import traceback
 
 import gi
 
@@ -14,10 +16,9 @@ gi.require_version('Adw', '1')
 gi.require_version('Gdk', '4.0')
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
-import cairo  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import cleanup, framedecode, ocr, stitcher  # noqa: E402
+from . import cleanup, export, framedecode, ocr, stitcher  # noqa: E402
 from .capture import Capture, jpeg_to_rgb  # noqa: E402
 from .device import (EXPOSURE_DEFAULT, EXPOSURE_MAX, EXPOSURE_MIN,  # noqa: E402
                      Scanner, ScannerError, find_device)
@@ -37,6 +38,7 @@ PREVIEW_EVERY = 0.4   # s between preview updates while scanning
 CONTRAST_MAX = 2.5    # contrast setting: 1 leaves the page as scanned
 CONTRAST_DEFAULT = 1.5
 PHOTO_CONTRAST_DEFAULT = 1.0   # photos come out as scanned
+STREAM_TIMEOUT = 2.0  # s without a frame while scanning: the scanner is gone
 ZOOM_MAX = 8.0        # times the size that fits the window
 ZOOM_STEP = 1.25      # per mouse-wheel notch
 SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), 'scannermouse', 'settings.json')
@@ -61,7 +63,8 @@ def _new_recording():
 def _load_settings():
     settings = {'auto_exposure': True, 'exposure': EXPOSURE_DEFAULT, 'best_frames': True,
                 'straighten': True, 'clean_background': True, 'contrast': CONTRAST_DEFAULT,
-                'mode': 'text', 'photo_contrast': PHOTO_CONTRAST_DEFAULT}
+                'mode': 'text', 'photo_contrast': PHOTO_CONTRAST_DEFAULT,
+                'ocr_languages': None}      # None: the system's language, German and English
     try:
         with open(SETTINGS_FILE) as f:
             settings.update(json.load(f))
@@ -93,6 +96,8 @@ class Window(Adw.ApplicationWindow):
         self.capture = None
         self.state = 'idle'            # idle | starting | scanning | stopping | aligning
         self.started_at = 0.0
+        self.last_frame_at = 0.0       # when the last frame arrived, to notice the stream breaking off
+        self.stop_reason = None        # why the scan ended, if not by the user
         self.last_buttons = 0
         self.live = None
         self.dirty = False
@@ -131,9 +136,84 @@ class Window(Adw.ApplicationWindow):
         for widget in (self.crop_button, self.rotate_right, self.rotate_left):
             header.pack_end(widget)
 
-        # scanner settings
         self.settings = _load_settings()
         self.metering = None                   # auto exposure state during the first frames of a scan
+        self.settings_button = self._build_settings_menu()
+        header.pack_end(self.settings_button)
+
+        self.page = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True)
+        # Ctrl + mouse wheel zooms: the picture grows inside the scroller
+        self.rendering = False         # a preview is being rendered in the background
+        self.render_again = False      # ... and another was asked for meanwhile
+        self.page_version = 0          # counts scans, to drop previews of a page since discarded
+        self.saving = False
+        self.zoom = 1.0                # times the size that fits the window
+        self.zoom_anchor = None        # (page point 0..1, pointer) to keep in place once laid out
+        self.pointer = None
+        self.render_scale = 1.0        # resolution of the preview relative to the full page
+        self.render_size = PREVIEW_SIZE  # longest side the preview was asked for
+        self.scroller = Gtk.ScrolledWindow(child=self.page)
+        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)   # before the scroller scrolls
+        wheel.connect('scroll', self._on_wheel)
+        self.scroller.add_controller(wheel)
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', lambda c, x, y: setattr(self, 'pointer', (x, y)))
+        motion.connect('leave', lambda c: setattr(self, 'pointer', None))
+        self.scroller.add_controller(motion)
+        for adj in (self.scroller.get_hadjustment(), self.scroller.get_vadjustment()):
+            adj.connect('changed', lambda adj: self._apply_zoom_anchor())
+        self.empty = Adw.StatusPage(
+            icon_name='scanner-symbolic', title='No Scan Yet',
+            description='Press <b>Start Scan</b>, then slowly sweep the mouse over the page.\n'
+                        'Press the <b>Scan</b> button on the mouse (or Esc) to finish.')
+        self.stack = Gtk.Stack()
+        self.stack.add_named(self.empty, 'empty')
+        self.stack.add_named(self.scroller, 'page')
+
+        self.live_view = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, width_request=320, height_request=122)
+        self.live_view.add_css_class('card')
+        self.status = Gtk.Label(xalign=0)
+        self.status.add_css_class('dim-label')
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END,
+                       valign=Gtk.Align.END, margin_end=12, margin_bottom=12)
+        self.progress = Gtk.ProgressBar(visible=False)
+        # movement speed while scanning: a coloured dot and a word
+        self.speed_dot = Gtk.Label(label='●', margin_start=10, margin_top=6, margin_bottom=6)
+        self.speed_label = Gtk.Label(xalign=0, margin_end=12)
+        self.speed_box = Gtk.Box(spacing=6, halign=Gtk.Align.START, visible=False)
+        self.speed_box.add_css_class('osd')           # readable on top of the page
+        self.speed_box.append(self.speed_dot)
+        self.speed_box.append(self.speed_label)
+        side.append(self.speed_box)
+        side.append(self.live_view)
+        side.append(self.progress)
+        side.append(self.status)
+        overlay = Gtk.Overlay(child=self.stack)
+        overlay.add_overlay(side)
+
+        self.views = Adw.ViewStack()
+        self.views.add_titled_with_icon(overlay, 'scan', 'Scan', 'image-x-generic-symbolic')
+        self.text_page = self._build_text_view()
+        self.views.add_titled_with_icon(self.text_page, 'text', 'Text', 'text-x-generic-symbolic')
+        header.set_title_widget(Adw.ViewSwitcher(stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE))
+
+        self.toasts = Adw.ToastOverlay(child=self.views)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        self.set_content(view)
+
+        keys = Gtk.ShortcutController()
+        keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string('Escape'),
+                                           Gtk.CallbackAction.new(lambda *_: self.stop_scan() or True)))
+        self.add_controller(keys)
+        self.connect('close-request', self._on_close)
+        self._update_mode()
+        GLib.timeout_add(150, self._refresh)
+        self._update_controls()
+
+    def _build_settings_menu(self):
+        """The settings button with its popover: scanning mode, exposure and how the page is finished."""
         self.auto_switch = Gtk.Switch(active=self.settings['auto_exposure'], valign=Gtk.Align.CENTER)
         self.exposure_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
                                                        EXPOSURE_MIN, EXPOSURE_MAX, 1)
@@ -207,76 +287,8 @@ class Window(Adw.ApplicationWindow):
         self.contrast_hint.add_css_class('caption')
         grid.attach(self.contrast_hint, 0, 14, 2, 1)
         self.text_settings = [self.clean_switch]
-        self.settings_button = Gtk.MenuButton(icon_name='emblem-system-symbolic', tooltip_text='Scanner Settings',
-                                              popover=Gtk.Popover(child=grid))
-        header.pack_end(self.settings_button)
-
-        self.page = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True)
-        # Ctrl + mouse wheel zooms: the picture grows inside the scroller
-        self.zoom = 1.0                # times the size that fits the window
-        self.zoom_anchor = None        # (page point 0..1, pointer) to keep in place once laid out
-        self.pointer = None
-        self.render_scale = 1.0        # resolution of the preview relative to the full page
-        self.render_size = PREVIEW_SIZE  # longest side the preview was asked for
-        self.scroller = Gtk.ScrolledWindow(child=self.page)
-        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
-        wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)   # before the scroller scrolls
-        wheel.connect('scroll', self._on_wheel)
-        self.scroller.add_controller(wheel)
-        motion = Gtk.EventControllerMotion()
-        motion.connect('motion', lambda c, x, y: setattr(self, 'pointer', (x, y)))
-        motion.connect('leave', lambda c: setattr(self, 'pointer', None))
-        self.scroller.add_controller(motion)
-        for adj in (self.scroller.get_hadjustment(), self.scroller.get_vadjustment()):
-            adj.connect('changed', lambda adj: self._apply_zoom_anchor())
-        self.empty = Adw.StatusPage(
-            icon_name='scanner-symbolic', title='No Scan Yet',
-            description='Press <b>Start Scan</b>, then slowly sweep the mouse over the page.\n'
-                        'Press the <b>Scan</b> button on the mouse (or Esc) to finish.')
-        self.stack = Gtk.Stack()
-        self.stack.add_named(self.empty, 'empty')
-        self.stack.add_named(self.scroller, 'page')
-
-        self.live_view = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, width_request=320, height_request=122)
-        self.live_view.add_css_class('card')
-        self.status = Gtk.Label(xalign=0)
-        self.status.add_css_class('dim-label')
-        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END,
-                       valign=Gtk.Align.END, margin_end=12, margin_bottom=12)
-        self.progress = Gtk.ProgressBar(visible=False)
-        # movement speed while scanning: a coloured dot and a word
-        self.speed_dot = Gtk.Label(label='●', margin_start=10, margin_top=6, margin_bottom=6)
-        self.speed_label = Gtk.Label(xalign=0, margin_end=12)
-        self.speed_box = Gtk.Box(spacing=6, halign=Gtk.Align.START, visible=False)
-        self.speed_box.add_css_class('osd')           # readable on top of the page
-        self.speed_box.append(self.speed_dot)
-        self.speed_box.append(self.speed_label)
-        side.append(self.speed_box)
-        side.append(self.live_view)
-        side.append(self.progress)
-        side.append(self.status)
-        overlay = Gtk.Overlay(child=self.stack)
-        overlay.add_overlay(side)
-
-        self.views = Adw.ViewStack()
-        self.views.add_titled_with_icon(overlay, 'scan', 'Scan', 'image-x-generic-symbolic')
-        self.text_page = self._build_text_view()
-        self.views.add_titled_with_icon(self.text_page, 'text', 'Text', 'text-x-generic-symbolic')
-        header.set_title_widget(Adw.ViewSwitcher(stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE))
-
-        self.toasts = Adw.ToastOverlay(child=self.views)
-        view = Adw.ToolbarView(content=self.toasts)
-        view.add_top_bar(header)
-        self.set_content(view)
-
-        keys = Gtk.ShortcutController()
-        keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string('Escape'),
-                                           Gtk.CallbackAction.new(lambda *_: self.stop_scan() or True)))
-        self.add_controller(keys)
-        self.connect('close-request', self._on_close)
-        self._update_mode()
-        GLib.timeout_add(150, self._refresh)
-        self._update_controls()
+        return Gtk.MenuButton(icon_name='emblem-system-symbolic', tooltip_text='Scanner Settings',
+                              popover=Gtk.Popover(child=grid))
 
     # -- scanning ---------------------------------------------------------
 
@@ -295,6 +307,7 @@ class Window(Adw.ApplicationWindow):
             self._toast('Scanner mouse not found. Is it plugged in?')
             return
         self.stitcher.reset()
+        self.page_version += 1
         self.analysis, self.page_turns = None, 0
         self._clear_text()
         self._set_zoom(1.0)
@@ -309,7 +322,7 @@ class Window(Adw.ApplicationWindow):
     def _start_worker(self, path):
         try:
             self.scanner = Scanner(path)
-            self.capture = Capture(path, self._on_frame)
+            self.capture = Capture(path, self._on_frame, self._stream_lost)
             self.capture.start()
             time.sleep(WARMUP)
             self.scanner.start_scan()
@@ -327,7 +340,8 @@ class Window(Adw.ApplicationWindow):
             stamp = time.strftime('%Y%m%d-%H%M%S')
             self.debug_files = (open(os.path.join(self.debug_dir, f'{stamp}.mjpg'), 'wb'),
                                 open(os.path.join(self.debug_dir, f'{stamp}.jsonl'), 'w'))
-        self.started_at = time.monotonic()
+        self.started_at = self.last_frame_at = time.monotonic()
+        self.stop_reason = None
         self.state = 'scanning'
         GLib.idle_add(self._update_controls)
 
@@ -336,6 +350,14 @@ class Window(Adw.ApplicationWindow):
         self.state = 'idle'
         self._update_controls()
         self._toast(f'Could not start scanning: {message}')
+
+    def _stream_lost(self, message=None):
+        """The scanner stopped sending pictures (unplugged, usually): end the scan and
+        keep what was scanned."""
+        if self.state == 'scanning':
+            self.stop_reason = ('The scanner stopped sending pictures. Was it unplugged? '
+                                'The page so far is kept.')
+            self.stop_scan()
 
     def stop_scan(self):
         if self.state != 'scanning':
@@ -349,7 +371,7 @@ class Window(Adw.ApplicationWindow):
         try:
             self.scanner.stop_scan()
         except (OSError, ScannerError) as e:
-            error = str(e)
+            error = f'Scanner did not confirm stop: {e}'
         self._teardown()
         # final re-registration of all segments and rebuild of the page
         self.state = 'aligning'
@@ -357,9 +379,9 @@ class Window(Adw.ApplicationWindow):
         try:
             self.stitcher.finish(lambda f: GLib.idle_add(self.progress.set_fraction, f))
         except Exception as e:              # keep the live result if the final pass fails
-            error = error or f'final alignment failed: {e}'
+            error = error or f'The final alignment failed ({e}); the page is shown as scanned'
         self.state = 'idle'
-        GLib.idle_add(self._stopped, error)
+        GLib.idle_add(self._stopped, self.stop_reason or error)
 
     def _stopped(self, error):
         self.analysis = None                    # measure the finished page afresh
@@ -372,7 +394,7 @@ class Window(Adw.ApplicationWindow):
         else:
             self._start_ocr()
         if error:
-            self._toast(f'Scanner did not confirm stop: {error}')
+            self._toast(error)
 
     def _teardown(self):
         if self.recording:
@@ -382,7 +404,6 @@ class Window(Adw.ApplicationWindow):
             for f in self.debug_files:
                 f.close()
             self.debug_files = None
-        self.recording = None          # raw frames of the current scan, kept for diagnosis
         if self.capture:
             self.capture.stop()
             self.capture = None
@@ -394,6 +415,7 @@ class Window(Adw.ApplicationWindow):
         """Runs on the GStreamer thread."""
         if self.state != 'scanning':
             return
+        self.last_frame_at = time.monotonic()
         if self.recording:
             self.recording.write(data)
         rec, jpeg = framedecode.decode(data)
@@ -427,7 +449,7 @@ class Window(Adw.ApplicationWindow):
                 'brightness': round(brightness, 1), 'added': added,
                 'ms': round((time.monotonic() - t0) * 1000, 1) if brightness >= DARK_FRAME else None,
                 'pos': [round(float(v), 1) for v in st.pos], 'theta_deg': round(float(np.degrees(st.theta)), 2),
-                'source': st.last_source, 'lost': st.lost, 'track': st.last_track,
+                'source': st.last_source, 'lost': st.lost, 'track': st.last_track, 'dropped': st.dropped,
                 'match': st.last_match}, default=float) + '\n')
 
     def _meter(self, green):
@@ -525,7 +547,7 @@ class Window(Adw.ApplicationWindow):
         again = Gtk.Button(icon_name='view-refresh-symbolic', tooltip_text='Recognise Again')
         again.connect('clicked', lambda *_: self._start_ocr())
         bar = Gtk.Box(spacing=6, margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
-        for widget in (self.text_status, again, copy):
+        for widget in (self.text_status, self._build_language_menu(), again, copy):
             bar.append(widget)
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         page.append(bar)
@@ -541,11 +563,40 @@ class Window(Adw.ApplicationWindow):
         self.text_stack.add_named(page, 'text')
         return self.text_stack
 
+    def _build_language_menu(self):
+        """A menu to choose which of the installed Tesseract languages to recognise."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=12, margin_bottom=12,
+                      margin_start=12, margin_end=12)
+        used = (ocr.languages(self.settings['ocr_languages']) or '').split('+')
+        self.language_checks = {}
+        for code in ocr.installed_languages():
+            check = Gtk.CheckButton(label=ocr.language_name(code), active=code in used)
+            check.connect('toggled', lambda *_: self._languages_changed())
+            self.language_checks[code] = check
+            box.append(check)
+        hint = Gtk.Label(label='Languages come with Tesseract’s data packages (tesseract-data-…).' if self.language_checks
+                         else 'Install Tesseract and a language (tesseract-data-…) to recognise text.',
+                         xalign=0, wrap=True, max_width_chars=30)
+        hint.add_css_class('dim-label')
+        hint.add_css_class('caption')
+        box.append(hint)
+        return Gtk.MenuButton(icon_name='preferences-desktop-locale-symbolic', tooltip_text='Languages',
+                              popover=Gtk.Popover(child=box))
+
+    def _languages_changed(self):
+        chosen = [code for code, check in self.language_checks.items() if check.get_active()]
+        if not chosen:
+            return                              # none ticked: keep the last choice
+        self.settings['ocr_languages'] = chosen
+        _save_settings(self.settings)
+        if self.state == 'idle':
+            self._schedule_ocr()
+
     def _start_ocr(self):
         """Recognise the finished page as it is currently shown (background thread)."""
         if self.state != 'idle' or self.stitcher.frames_used == 0 or self.settings['mode'] == 'photo':
             return
-        langs = ocr.languages()
+        langs = ocr.languages(self.settings['ocr_languages'])
         if langs is None:
             self.text_stack.set_visible_child_name('empty')
             self._toast('Install Tesseract (and tesseract-data-deu for German) to recognise text')
@@ -555,8 +606,12 @@ class Window(Adw.ApplicationWindow):
         self.text_stack.set_visible_child_name('busy')
 
         def work():
-            page = self._render(crop=crop)
-            lines = ocr.recognise(page, langs) if page is not None else []
+            lines = []
+            try:
+                page = self._render(crop=crop)
+                lines = ocr.recognise(page, langs) if page is not None else []
+            except Exception:                   # whatever happens, the spinner must end
+                traceback.print_exc()
             GLib.idle_add(self._show_text, lines, langs, version)
         threading.Thread(target=work, daemon=True).start()
 
@@ -581,8 +636,7 @@ class Window(Adw.ApplicationWindow):
                 buf.insert_with_tags_by_name(buf.get_end_iter(), word.text, *tags) if tags else \
                     buf.insert(buf.get_end_iter(), word.text)
             buf.insert(buf.get_end_iter(), '\n')
-        names = {'deu': 'German', 'eng': 'English'}
-        language = ' + '.join(names.get(l, l) for l in langs.split('+'))
+        language = ' + '.join(ocr.language_name(code) for code in langs.split('+'))
         self.text_status.set_label(f'{len(lines)} line{"s" if len(lines) != 1 else ""} · {language}'
                                    + (f' · {uncertain} uncertain words underlined' if uncertain else ''))
         self.text_stack.set_visible_child_name('text' if lines else 'empty')
@@ -600,14 +654,15 @@ class Window(Adw.ApplicationWindow):
         self.get_clipboard().set(self._text())
         self._toast('Text copied')
 
-    def _render(self, max_size=None, crop=None):
+    def _render(self, max_size=None, crop=True):
         """The page as it will be saved: straightened, cleaned, cropped and rotated
-        as chosen, or None."""
+        as chosen, or None. Runs on background threads, so it touches no widgets."""
         page = self.stitcher.page(max_size, best=self.settings['best_frames'])
         if page is None:
             return None
         img, covered, scale = page
-        self.render_scale = scale
+        if max_size:
+            self.render_scale = scale           # of the preview
         turns = self.turns
         if self.settings['mode'] == 'text' and (self.settings['straighten'] or self.settings['clean_background']):
             angle, is_text = self._analyse(img, covered)
@@ -621,7 +676,7 @@ class Window(Adw.ApplicationWindow):
             angle, found = self._analyse(img, covered)
             if found:
                 img, covered = cleanup.rotate(img, covered, angle)
-        if self.crop_button.get_active() if crop is None else crop:
+        if crop:
             top, bottom, left, right = cleanup.crop_box(covered)
             img = img[top:bottom, left:right]
         img = cleanup.contrast(img, self.settings[self._contrast_key()])
@@ -658,12 +713,34 @@ class Window(Adw.ApplicationWindow):
         GLib.idle_add(apply)
 
     def _show_page(self):
+        """Update the preview. It is rendered on a background thread, so neither the
+        window nor (through the page lock) live tracking waits for it; a request made
+        while one is under way is served right after it."""
+        if self.rendering:
+            self.render_again = True
+            return
+        self.rendering, self.render_again = True, False
         self.render_size = self._preview_size()
-        page = self._render(self.render_size)
-        if page is not None:
+        size, crop, version = self.render_size, self.crop_button.get_active(), self.page_version
+
+        def work():
+            page = None
+            try:
+                page = self._render(size, crop)
+            except Exception:
+                traceback.print_exc()
+            GLib.idle_add(self._page_rendered, page, version)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _page_rendered(self, page, version):
+        self.rendering = False
+        if page is not None and version == self.page_version:   # else: of a page since discarded
             self.page.set_paintable(_texture(page))
             self._size_page()
             self.stack.set_visible_child_name('page')
+        if self.render_again:
+            self._show_page()
+        return GLib.SOURCE_REMOVE
 
     # -- zoom -------------------------------------------------------------
 
@@ -773,6 +850,9 @@ class Window(Adw.ApplicationWindow):
 
     def _refresh(self):
         if self.state == 'scanning':
+            if time.monotonic() - self.last_frame_at > STREAM_TIMEOUT:
+                self._stream_lost()             # no error was reported, but nothing arrives
+                return GLib.SOURCE_CONTINUE
             if time.monotonic() - self.last_preview >= PREVIEW_EVERY:
                 self.last_preview = time.monotonic()
                 self._show_page()
@@ -817,7 +897,7 @@ class Window(Adw.ApplicationWindow):
             self.scan_button.remove_css_class('destructive-action')
             self.scan_button.add_css_class('suggested-action')
         has_page = self.stitcher.frames_used > 0
-        self.save_button.set_sensitive(self.state == 'idle' and has_page)
+        self.save_button.set_sensitive(self.state == 'idle' and has_page and not self.saving)
         self.new_button.set_sensitive(self.state == 'idle' and has_page)
         for widget in (self.rotate_left, self.rotate_right, self.crop_button):
             widget.set_sensitive(has_page or self.state == 'scanning')
@@ -842,6 +922,9 @@ class Window(Adw.ApplicationWindow):
         if left_out:
             reasons = ', '.join(f'{n} {why}' for why, n in left_out.most_common())
             text += f' · left out of best page: {reasons}'
+        if self.stitcher.dropped:
+            n = self.stitcher.dropped
+            text += f' · {n} frame{"s" if n != 1 else ""} dropped (the computer was busy)'
         if self.stitcher.restarts:
             text += ' · started afresh where the mouse was put down after a lift'
         return text
@@ -861,6 +944,7 @@ class Window(Adw.ApplicationWindow):
     def new_page(self):
         def clear():
             self.stitcher.reset()
+            self.page_version += 1
             self.analysis, self.page_turns = None, 0
             self._clear_text()
             self.dirty = False
@@ -878,10 +962,12 @@ class Window(Adw.ApplicationWindow):
     def save(self):
         dialog = Gtk.FileDialog(title='Save Scan', initial_name='scan.png')
         filters = Gio.ListStore.new(Gtk.FileFilter)
-        for name, pattern in (('PNG image', '*.png'), ('PDF document (searchable when text was recognised)', '*.pdf'),
-                              ('Recognised text', '*.txt')):
+        for name, patterns in (('PNG image', ['*.png']), ('JPEG image', ['*.jpg', '*.jpeg']),
+                               ('PDF document (searchable when text was recognised)', ['*.pdf']),
+                               ('Recognised text', ['*.txt'])):
             f = Gtk.FileFilter(name=name)
-            f.add_pattern(pattern)
+            for pattern in patterns:
+                f.add_pattern(pattern)
             filters.append(f)
         dialog.set_filters(filters)
         dialog.save(self, None, self._on_save)
@@ -901,22 +987,40 @@ class Window(Adw.ApplicationWindow):
                 return
             self._toast(f'Saved {GLib.path_get_basename(path)}')
             return
-        page = self._render()
-        try:
-            if path.lower().endswith('.pdf'):
-                # with a recognised text, the PDF gets an invisible text layer
-                searchable = self._text().strip() and ocr.searchable_pdf(page, path, stitcher.DPI)
-                if not searchable:
-                    _save_pdf(page, path)
-            else:
-                if not path.lower().endswith('.png'):
-                    path += '.png'
-                _texture(page).save_to_png(path)
-        except (OSError, cairo.Error, GLib.Error) as e:
-            self._toast(f'Could not save: {e}')
-            return
-        self.dirty = False
-        self._toast(f'Saved {GLib.path_get_basename(path)}')
+        if not path.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg')):
+            path += '.png'
+        # rendering the full page and writing it takes a moment: off the UI thread
+        crop, has_text = self.crop_button.get_active(), bool(self._text().strip())
+        langs = ocr.languages(self.settings['ocr_languages'])
+        self.saving = True
+        self._update_controls()
+
+        def work():
+            error = None
+            try:
+                page = self._render(crop=crop)
+                if page is None:
+                    raise OSError('there is no page')
+                if path.lower().endswith('.pdf'):
+                    # with a recognised text, the PDF gets an invisible text layer
+                    if not (has_text and ocr.searchable_pdf(page, path, stitcher.DPI, langs)):
+                        export.save_pdf(page, path, stitcher.DPI)
+                else:
+                    export.save_image(page, path, stitcher.DPI)
+            except Exception as e:
+                error = str(e)
+            GLib.idle_add(self._saved, path, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _saved(self, path, error):
+        self.saving = False
+        if error:
+            self._toast(f'Could not save: {error}')
+        else:
+            self.dirty = False
+            self._toast(f'Saved {GLib.path_get_basename(path)}')
+        self._update_controls()
+        return GLib.SOURCE_REMOVE
 
     def _on_close(self, *_):
         if self.scanner:
@@ -930,20 +1034,6 @@ class Window(Adw.ApplicationWindow):
         return False
 
 
-def _save_pdf(gray, path):
-    h, w = gray.shape
-    rgb = np.empty((h, w, 4), np.uint8)
-    rgb[..., 0] = rgb[..., 1] = rgb[..., 2] = gray
-    rgb[..., 3] = 255
-    image = cairo.ImageSurface.create_for_data(memoryview(rgb), cairo.FORMAT_RGB24, w, h, w * 4)
-    scale = 72.0 / stitcher.DPI
-    surface = cairo.PDFSurface(path, w * scale, h * scale)
-    cr = cairo.Context(surface)
-    cr.scale(scale, scale)
-    cr.set_source_surface(image, 0, 0)
-    cr.paint()
-    surface.finish()
-
 
 class Application(Adw.Application):
     def __init__(self):
@@ -956,6 +1046,16 @@ class Application(Adw.Application):
         if os.path.isdir(icons):
             Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(icons)
         Gtk.Window.set_default_icon_name(APP_ID)
+        # Ended from outside (logout, kill, Ctrl+C) during a scan, the mouse would stay in
+        # scan mode, where it doesn't work as a mouse: close the window properly instead
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, number, self._on_signal)
+
+    def _on_signal(self):
+        for window in self.get_windows():
+            window.close()
+        self.quit()
+        return GLib.SOURCE_REMOVE
 
     def do_activate(self):
         win = self.get_active_window() or Window(self)

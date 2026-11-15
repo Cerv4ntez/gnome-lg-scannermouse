@@ -12,7 +12,9 @@ and lines. On top of that this module works out:
 """
 
 import csv
+import functools
 import io
+import locale
 import shutil
 import subprocess
 import tempfile
@@ -21,7 +23,17 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-PREFERRED_LANGUAGES = ('deu', 'eng')   # used when installed; German needs tesseract-data-deu
+PREFERRED_LANGUAGES = ('deu', 'eng')   # used when installed, after the system's language
+# Tesseract's codes for the languages of common locales, with their names
+LANGUAGES = {
+    'cs': ('ces', 'Czech'), 'da': ('dan', 'Danish'), 'de': ('deu', 'German'), 'el': ('ell', 'Greek'),
+    'en': ('eng', 'English'), 'es': ('spa', 'Spanish'), 'fi': ('fin', 'Finnish'), 'fr': ('fra', 'French'),
+    'hu': ('hun', 'Hungarian'), 'it': ('ita', 'Italian'), 'ja': ('jpn', 'Japanese'), 'ko': ('kor', 'Korean'),
+    'nb': ('nor', 'Norwegian'), 'nl': ('nld', 'Dutch'), 'pl': ('pol', 'Polish'), 'pt': ('por', 'Portuguese'),
+    'ro': ('ron', 'Romanian'), 'ru': ('rus', 'Russian'), 'sv': ('swe', 'Swedish'), 'tr': ('tur', 'Turkish'),
+    'uk': ('ukr', 'Ukrainian'), 'zh': ('chi_sim', 'Chinese (simplified)'),
+}
+NOT_LANGUAGES = ('osd', 'equ')         # Tesseract data for orientation and equations
 BOLD_RATIO = 1.25             # stroke thickness vs the page's typical text for bold
 LARGE_RATIO = 1.3             # line height vs the typical line for larger text
 UNCERTAIN = 60                # confidence (0..100) below which a word counts as uncertain
@@ -55,17 +67,38 @@ def available():
     return shutil.which('tesseract') is not None
 
 
-def languages():
-    """The installed languages to use, e.g. 'deu+eng', or None if Tesseract is missing."""
+@functools.cache
+def installed_languages():
+    """Tesseract's codes of the installed languages, sorted; empty if Tesseract is missing.
+    Asked once: languages installed later show after a restart."""
     if not available():
-        return None
+        return ()
     try:
         out = subprocess.run(['tesseract', '--list-langs'], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
-    installed = set(out.split())
-    chosen = [lang for lang in PREFERRED_LANGUAGES if lang in installed]
-    return '+'.join(chosen) if chosen else None
+        return ()
+    # the first line is a heading; script data ("script/Latin") isn't offered
+    return tuple(sorted(code for code in out.split('\n')[1:]
+                        if code and '/' not in code and code not in NOT_LANGUAGES))
+
+
+def language_name(code):
+    return next((name for c, name in LANGUAGES.values() if c == code), code)
+
+
+def languages(chosen=None):
+    """The languages to recognise, e.g. 'deu+eng', or None if none is installed.
+
+    `chosen`: the user's choice (codes); without one, the system's language and
+    PREFERRED_LANGUAGES, as far as installed."""
+    installed = installed_languages()
+    use = [code for code in chosen or () if code in installed]
+    if not use:
+        # the system's language first, unless it is one of the preferred ones anyway
+        system = LANGUAGES.get((locale.getlocale()[0] or '')[:2].lower(), (None,))[0]
+        first = () if system in PREFERRED_LANGUAGES else (system,)
+        use = [code for code in first + PREFERRED_LANGUAGES if code in installed]
+    return '+'.join(use) if use else None
 
 
 def recognise(gray, langs=None):
@@ -75,8 +108,11 @@ def recognise(gray, langs=None):
         return []
     with tempfile.NamedTemporaryFile(suffix='.png') as f:
         cv2.imwrite(f.name, gray)
-        out = subprocess.run(['tesseract', f.name, 'stdout', '-l', langs, '--psm', '3', 'tsv'],
-                             capture_output=True, text=True, timeout=300).stdout
+        try:
+            out = subprocess.run(['tesseract', f.name, 'stdout', '-l', langs, '--psm', '3', 'tsv'],
+                                 capture_output=True, text=True, timeout=300).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []                           # Tesseract failed or took too long
     rows = list(csv.DictReader(io.StringIO(out), delimiter='\t', quoting=csv.QUOTE_NONE))
     lines, current, key = [], None, None
     for r in rows:

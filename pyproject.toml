@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scannermouse"
-version = "0.1.13"
+version = "0.1.14"
 description = "GNOME app for the LG Smart Scan mouse (LSM-100/LSM-150)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE", "scannermouse/data/LICENSE-XFeat"]
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = ["numpy", "scipy", "opencv-python", "PyGObject", "pycairo"]
 
 [project.urls]
@@ -23,3 +23,6 @@ packages = ["scannermouse"]
 
 [tool.setuptools.package-data]
 scannermouse = ["data/xfeat.onnx", "data/LICENSE-XFeat"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

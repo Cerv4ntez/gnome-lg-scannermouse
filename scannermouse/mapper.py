@@ -64,6 +64,10 @@ PLAUSIBLE_PX = 200            # an overlap may move a segment at most this far f
                               # different places that share words, typically 400-1000 px off
 SOLVE_EVERY = 1.5             # s between position solves
 COMPOSE_EVERY = 3.0           # s at least between page rebuilds (they compete with live tracking)
+BUSY_SHARE = 2.0              # a solve or rebuild that took t s is not started again within this many t,
+                              # so on long scans (where they take seconds) the overlap search keeps its share
+INLINE_SOLVE_EVERY = 15       # segments between position solves when run in step with the tracker ...
+INLINE_COMPOSE_EVERY = 40     # ... and between page rebuilds (see InlineMapper)
 MISPLACED_PX = 12             # median disagreement with neighbours that marks a segment misplaced
 ODOMETRY_WEIGHT = 0.1         # weight of sensor-only links between consecutive segments
 RATIO = 0.8
@@ -220,7 +224,7 @@ class Mapper:
             progress(1.0)
 
     def _register_loop(self):
-        last_solve = time.monotonic()
+        last_solve, wait = time.monotonic(), SOLVE_EVERY
         while self.running:
             if self.pending:
                 self._search(self.pending.popleft())
@@ -231,17 +235,21 @@ class Mapper:
                 time.sleep(0.002)
             else:
                 time.sleep(0.05)
-            if time.monotonic() - last_solve > SOLVE_EVERY:
+            if time.monotonic() - last_solve > wait:
+                started = time.monotonic()
                 self._solve()
                 last_solve = time.monotonic()
+                # on a long scan a solve takes seconds: leave at least as long for the search
+                wait = max(SOLVE_EVERY, BUSY_SHARE * (last_solve - started))
 
     def _compose_loop(self):
-        last = 0.0
+        last, wait = 0.0, COMPOSE_EVERY
         while self.running:
             stale = self.rendered is None or self.rendered[0] != self.pose_version
-            if stale and time.monotonic() - last >= COMPOSE_EVERY:
+            if stale and time.monotonic() - last >= wait:
                 last = time.monotonic()
                 self._compose()
+                wait = max(COMPOSE_EVERY, BUSY_SHARE * (time.monotonic() - last))
             else:
                 time.sleep(0.05)
 
@@ -693,6 +701,12 @@ class MapperProcess:
                 raise RuntimeError('the background process stopped')
         self.progress = None
 
+    def alive(self):
+        return self.process.is_alive()
+
+    def step(self):
+        """Nothing to do: the background process works on its own (see InlineMapper)."""
+
     def stop(self):
         """Stop working on the current scan (the process stays, for the next one)."""
         self.reset()
@@ -731,3 +745,86 @@ class MapperProcess:
             elif kind == 'finished' and current:
                 self.stats = collections.Counter(msg[2])
                 self.finished.set()
+
+
+class InlineMapper:
+    """The Mapper run in step with the tracker, in the same process and thread, for
+    replaying recordings: the same recording always gives the same page.
+
+    The background process works as fast as the computer lets it, so what it has found by
+    the time a given frame arrives differs from run to run, and with it the page. Here the
+    work is tied to the segments instead: each new one is searched for overlaps at once, and
+    positions are solved and the page rebuilt every so many segments (about the pace of the
+    background process at normal scanning speed). Same interface as MapperProcess; the
+    tracker calls `step` after each frame.
+    """
+
+    def __init__(self, on_render):
+        self.on_render = on_render
+        self.lock = threading.Lock()
+        self.scan = 0
+        self.mapper = None
+        self.active = False
+        self._clear()
+
+    _clear = MapperProcess._clear
+    pose = MapperProcess.pose
+    corrected = MapperProcess.corrected
+    adopt = MapperProcess.adopt
+
+    def reset(self):
+        from .stitcher import render_segments
+
+        def render(segments, poses, fit, stats):
+            canvas = render_segments(segments, poses, fit, stats)
+            self.stats = collections.Counter(stats)
+            self.on_render(len(segments), np.array(poses), fit, canvas)
+        with self.lock:
+            self.scan += 1
+            self._clear()
+        self.mapper = Mapper(render)
+        self.active = False
+        self.solved = self.composed = 0         # segments there were at the last solve / rebuild
+
+    def start(self):
+        self.active = True
+
+    def add(self, img, sharpness, feats, pose, link, confidence, reason=None):
+        with self.lock:
+            i = len(self.segments)
+            self.segments.append(LocalSegment(img, sharpness, confidence, reason))
+            if link is not None and i > 0:
+                self.poses.append(_compose(self.poses[i - 1], np.array(link[0], float)))
+            else:
+                self.poses.append(np.array(pose, float))
+        self.mapper.add(img, sharpness, feats, pose, link, confidence, reason)
+        return i
+
+    def step(self):
+        """The Mapper's share of work after a frame (outside the tracker's lock: a
+        rebuilt page is handed to the tracker from here)."""
+        m = self.mapper
+        if not self.active:
+            return
+        while m.pending:
+            m._search(m.pending.popleft())
+        n = len(m.segments)
+        if n - self.solved >= INLINE_SOLVE_EVERY:
+            self.solved = n
+            m._solve()
+        if n - self.composed >= INLINE_COMPOSE_EVERY and (m.rendered is None or m.rendered[0] != m.pose_version):
+            self.composed = n
+            m._compose()
+
+    def finish(self, progress=None):
+        self.mapper.finish(progress)
+        self.stats = collections.Counter(self.mapper.stats)
+
+    def alive(self):
+        return True
+
+    def stop(self):
+        self.reset()
+
+    def close(self):
+        pass

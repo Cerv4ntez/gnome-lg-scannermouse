@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.scannermouse.ScannerMouse</id>
+  <name>Scanner Mouse</name>
+  <summary>Scan documents and photos with the LG Smart Scan mouse</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later AND Apache-2.0</project_license>
+  <developer id="io.github.cerv4ntez">
+    <name>Cerv4ntez</name>
+  </developer>
+  <description>
+    <p>
+      Scanner Mouse makes the LG Smart Scan mouse (LSM-100, LSM-150) work as a hand scanner on Linux.
+      Sweep the mouse over a page and watch it appear; the app joins the camera pictures into one
+      page while you scan and corrects it as more of the page comes in.
+    </p>
+    <ul>
+      <li>Text pages are straightened, cleaned and recognised with Tesseract</li>
+      <li>Photos keep their tones and are turned so their edges run straight</li>
+      <li>Save as PNG, JPEG, searchable PDF or plain text</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.scannermouse.ScannerMouse.desktop</launchable>
+  <url type="homepage">https://github.com/Cerv4ntez/gnome-lg-scannermouse</url>
+  <url type="bugtracker">https://github.com/Cerv4ntez/gnome-lg-scannermouse/issues</url>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Graphics</category>
+    <category>Scanning</category>
+  </categories>
+  <provides>
+    <binary>scannermouse</binary>
+    <modalias>usb:v043Ep70D7d*</modalias>
+  </provides>
+</component>
